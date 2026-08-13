@@ -1,0 +1,24 @@
+---
+import config from 'virtual:config'
+
+const walineConfig = config.integ.waline
+const enabled = walineConfig.enable && !!walineConfig.server
+---
+
+{enabled && <waline-views data-server={walineConfig.server} />}
+
+<script>
+  import { mountCounters } from '@/lib/waline-views'
+
+  class WalineViews extends HTMLElement {
+    connectedCallback() {
+      // Sole owner of every counter element on the page — the comment widget
+      // runs with `pageview`/`comment` off so nothing is fetched twice.
+      mountCounters(this.dataset.server || '')
+    }
+  }
+
+  if (!customElements.get('waline-views')) {
+    customElements.define('waline-views', WalineViews)
+  }
+</script>
