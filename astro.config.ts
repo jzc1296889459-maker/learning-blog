@@ -68,7 +68,7 @@ const bilingualReadingTime = (): AstroIntegration => ({
 // https://astro.build/config
 export default defineConfig({
   // Top-Level Options
-  site: 'https://www.example.com',
+  site: 'https://example.com',
   // base: '/docs',
   trailingSlash: 'never',
 
