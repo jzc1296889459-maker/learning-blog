@@ -3,9 +3,9 @@ import type { MarkdownHeading, MarkdownLayoutProps } from 'astro'
 
 import { Button, Icon } from 'astro-pure/user'
 import { cn } from 'astro-pure/utils'
+import PageLayout from '@/layouts/BaseLayout.astro'
 import BackToTop from '@/components/navigation/BackToTop.astro'
 import TableOfContents from '@/components/navigation/TableOfContents.astro'
-import PageLayout from '@/layouts/BaseLayout.astro'
 import { integ } from '@/site-config'
 
 type Props = MarkdownLayoutProps<{
@@ -20,7 +20,7 @@ type Props = MarkdownLayoutProps<{
 
 const { frontmatter, headings } = Astro.props
 const { title, description, heroImage, language, back } = frontmatter
-const socialImage = heroImage?.src ?? '/images/social-card.png'
+const socialImage = heroImage?.src
 const tocHeadings = headings.filter(({ depth }) => depth <= 3)
 ---
 

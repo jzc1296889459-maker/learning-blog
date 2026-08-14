@@ -37,16 +37,11 @@ const {
   enHero = false
 } = Astro.props
 
-const {
-  description,
-  publishDate,
-  title,
-  updatedDate
-} = data
+const { description, publishDate, title, updatedDate } = data
 
 // English mirrors (id ends in `.en`) reuse the Chinese post's generated OG image
 // unless a post provides a custom static social card.
-const socialImage = data.ogImage ?? `/og/blog/${id.replace(/\.en$/, '')}.png`
+const socialImage = data.ogImage
 const articleDate = updatedDate?.toISOString() ?? publishDate.toISOString()
 const primaryColor = data.heroImage?.color ?? 'hsl(var(--primary) / var(--un-text-opacity))'
 const tocDepth = data.tocDepth ?? 3
@@ -72,7 +67,7 @@ const articleLd = {
   inLanguage: lang === 'en' ? 'en' : 'zh-CN',
   datePublished: publishDate.toISOString(),
   dateModified: (updatedDate ?? publishDate).toISOString(),
-  image: new URL(socialImage, Astro.site).href,
+  ...(socialImage ? { image: new URL(socialImage, Astro.site).href } : {}),
   ...(data.tags.length ? { keywords: data.tags } : {}),
   author: { '@id': `${origin}/#person` },
   publisher: { '@id': `${origin}/#person` },

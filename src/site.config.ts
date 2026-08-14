@@ -22,11 +22,7 @@ export const theme: ThemeUserConfig = {
       year: 'numeric'
     }
   },
-  /** Set a logo image to show in the homepage. */
-  logo: {
-    src: 'src/assets/avatar.png',
-    alt: 'Avatar'
-  },
+
 
   // === Global configuration ===
   titleDelimiter: '•',

@@ -16,7 +16,7 @@ const { articleDate, description, noindex = false, ogImage, title } = Astro.prop
 
 const siteTitle = `${title} ${config.titleDelimiter} ${config.title}`
 const canonicalURL = new URL(Astro.url.pathname, Astro.site)
-const socialImageURL = new URL(ogImage ? ogImage : '/og/default.png', Astro.url).href
+const socialImageURL = ogImage ? new URL(ogImage, Astro.url).href : null
 const socialImageAlt = `${title} social preview`
 
 // Bilingual SEO: per-language og:locale, and hreflang alternates only for pages
@@ -53,16 +53,10 @@ const siteGraph = {
       '@type': 'Person',
       '@id': `${origin}/#person`,
       name: config.author,
-      description: 'Undergraduate student at the University of Melbourne',
+      description: 'Learning programming, AI, and AI agents from zero.',
       url: `${origin}/`,
       image: `${origin}/favicon/apple-touch-icon.png`,
-      sameAs: [
-        'https://github.com/joyehuang',
-        'https://x.com/deshiou0604',
-        'https://space.bilibili.com/3546914882587480',
-        'https://www.xiaohongshu.com/user/profile/65a14d170000000022017286'
-      ],
-      affiliation: { '@type': 'CollegeOrUniversity', name: 'University of Melbourne' }
+      sameAs: ['https://github.com/jzc1296889459-maker']
     }
   ]
 }
@@ -81,14 +75,6 @@ const siteGraph = {
 
 {/* Font preloads */}
 <link rel='preload' href='/fonts/Satoshi-Variable.ttf' as='font' type='font/ttf' crossorigin />
-
-{/* JetBrains Mono — terminal / dev mode / mascot */}
-<link rel='preconnect' href='https://fonts.googleapis.com' />
-<link rel='preconnect' href='https://fonts.gstatic.com' crossorigin />
-<link
-  rel='stylesheet'
-  href='https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap'
-/>
 
 {/* Canonical URL */}
 <link rel='canonical' href={canonicalURL} />
@@ -114,10 +100,16 @@ const siteGraph = {
 <meta content={config.title} property='og:site_name' />
 <meta content={ogLocale} property='og:locale' />
 {ogLocaleAlternate && <meta content={ogLocaleAlternate} property='og:locale:alternate' />}
-<meta content={socialImageURL} property='og:image' />
-<meta content={socialImageAlt} property='og:image:alt' />
-<meta content='1200' property='og:image:width' />
-<meta content='630' property='og:image:height' />
+{
+  socialImageURL && (
+    <>
+      <meta content={socialImageURL} property='og:image' />
+      <meta content={socialImageAlt} property='og:image:alt' />
+      <meta content='1200' property='og:image:width' />
+      <meta content='630' property='og:image:height' />
+    </>
+  )
+}
 {
   articleDate && (
     <>
@@ -128,12 +120,18 @@ const siteGraph = {
 }
 
 {/* Twitter */}
-<meta content='summary_large_image' property='twitter:card' />
+<meta content={socialImageURL ? 'summary_large_image' : 'summary'} property='twitter:card' />
 <meta content={canonicalURL} property='twitter:url' />
 <meta content={title} property='twitter:title' />
 <meta content={description} property='twitter:description' />
-<meta content={socialImageURL} property='twitter:image' />
-<meta content={socialImageAlt} property='twitter:image:alt' />
+{
+  socialImageURL && (
+    <>
+      <meta content={socialImageURL} property='twitter:image' />
+      <meta content={socialImageAlt} property='twitter:image:alt' />
+    </>
+  )
+}
 
 {/* Sitemap */}
 <link href='/sitemap.xml' rel='sitemap' type='application/xml' />
