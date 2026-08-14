@@ -1,11 +1,8 @@
 ---
 import { getLangFromUrl } from '@/i18n/ui'
-import Analytics from '@vercel/analytics/astro'
-import SpeedInsights from '@vercel/speed-insights/astro'
 
 import { Footer } from 'astro-pure/components/basic'
 import type { SiteMeta } from 'astro-pure/types'
-import AnalyticsEvents from '@/components/AnalyticsEvents.astro'
 import BaseHead from '@/components/BaseHead.astro'
 import ViewCounter from '@/components/comment/ViewCounter.astro'
 import Header from '@/components/Header.astro'
@@ -55,9 +52,6 @@ const htmlLang = lang === 'en' ? 'en' : config.locale.lang
       {chrome && <Footer />}
     </div>
 
-    <Analytics />
-    <AnalyticsEvents />
-    <SpeedInsights />
     <ViewCounter />
 
     {/* Set highlight color */}
