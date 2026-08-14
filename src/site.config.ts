@@ -3,11 +3,11 @@ import type { Config, IntegrationUserConfig, ThemeUserConfig } from 'astro-pure/
 export const theme: ThemeUserConfig = {
   // === Basic configuration ===
   /** Title for your website. Will be used in metadata and as browser tab title. */
-  title: 'Joye Personal Blog',
+  title: 'My learning Blog',
   /** Will be used in index page & copyright declaration */
-  author: 'Joye',
+  author: 'James',
   /** Description metadata for your website. Can be used in page metadata. */
-  description: 'Stay hungry, stay foolish',
+  description: '记录从零开始学习AI和Agent',
   /** The default favicon for your site which should be a path to an image in the `public/` directory. */
   favicon: '/favicon/favicon.ico',
   /** Specify the default language for this site. */
@@ -49,12 +49,9 @@ export const theme: ThemeUserConfig = {
     menu: [
       { title: 'Blog', link: '/blog' },
       { title: 'Notes', link: '/notes' },
-      { title: 'Lab', link: '/lab' },
-      { title: 'Talks', link: '/talks' },
-      { title: 'Projects', link: '/projects' },
-      { title: 'Links', link: '/links' },
+
       { title: 'About', link: '/about' },
-      { title: 'Contact', link: '/contact' }
+
     ]
   },
 
@@ -65,7 +62,7 @@ export const theme: ThemeUserConfig = {
     credits: true,
     /** Optional details about the social media accounts for this site. */
     social: {
-      github: 'https://github.com/joyehuang'
+      github: 'https://github.com/jzc1296889459-maker'
       // linkedin: 'https://www.linkedin.com/in/joyehuang/'
     }
   },
@@ -150,7 +147,7 @@ export const integ: IntegrationUserConfig = {
     }
   },
   waline: {
-    enable: true,
+    enable: false,
     server: 'https://waline.joyehuang.me',
     // Counter elements are driven by `lib/waline-views`, which throttles the
     // database writes. Letting the widget count too would double every query.
