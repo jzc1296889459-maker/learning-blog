@@ -69,5 +69,4 @@ The inherited source code is available under the Apache License 2.0. The origina
 The original author's articles, images, presentations, QR codes, and personal
 content are not covered by the reusable template license and must not be reused here.
 
-Unless stated otherwise, new blog posts and personal content in this repository
-belong to James.
+Unless stated otherwise, original blog posts and personal content are © 2026 James. All rights reserved.

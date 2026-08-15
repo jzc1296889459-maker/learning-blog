@@ -1,0 +1,71 @@
+---
+import type { CollectionEntry } from 'astro:content'
+import { formatDate } from '@/i18n/date'
+import type { Lang } from '@/i18n/ui'
+
+import { Icon } from 'astro-pure/user'
+import config from '@/site-config'
+
+interface Props {
+  data: CollectionEntry<'blog' | 'blogEn'>['data']
+  lang: Lang
+  class?: string
+}
+
+const {
+  data: { title, publishDate },
+  lang,
+  class: className
+} = Astro.props
+
+const labels =
+  lang === 'en'
+    ? {
+        author: 'Author',
+        published: 'Published',
+        copyright: 'Copyright'
+      }
+    : {
+        author: '作者',
+        published: '发布日期',
+        copyright: '版权'
+      }
+
+const copyrightText =
+  lang === 'en'
+    ? `© ${publishDate.getFullYear()} ${config.author}. All rights reserved.`
+    : `© ${publishDate.getFullYear()} ${config.author}。保留所有权利。`
+---
+
+<div
+  class:list={[
+    'relative flex flex-col gap-y-2 rounded-xl border px-3 py-2 sm:px-4 sm:py-3',
+    className
+  ]}
+>
+  <Icon class='absolute end-4 top-4 size-20 opacity-10' name='copyright' />
+
+  <div class='flex flex-col'>
+    <div class='font-medium text-foreground'>{title}</div>
+    <div class='text-sm'>{Astro.url.pathname}</div>
+  </div>
+
+  <div class='flex flex-row flex-wrap justify-start gap-x-5 gap-y-1 sm:gap-x-8'>
+    <div class='flex gap-x-2 sm:flex-col'>
+      <span>{labels.author}</span>
+      <span class='text-sm text-foreground'>{config.author}</span>
+    </div>
+
+    <div class='flex gap-x-2 sm:flex-col'>
+      <span>{labels.published}</span>
+      <span class='text-sm text-foreground'>
+        {formatDate(publishDate, lang, { month: 'long' })}
+      </span>
+    </div>
+
+    <div class='flex gap-x-2 sm:flex-col'>
+      <span>{labels.copyright}</span>
+      <span class='text-sm text-foreground'>{copyrightText}</span>
+    </div>
+  </div>
+</div>
