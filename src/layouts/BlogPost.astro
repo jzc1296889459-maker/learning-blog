@@ -12,7 +12,6 @@ import { ArticleBottom, Copyright, Hero } from 'astro-pure/components/pages'
 import PageLayout from '@/layouts/ContentLayout.astro'
 import CopyrightEn from '@/components/blog/CopyrightEn.astro'
 import HeroEn from '@/components/blog/HeroEn.astro'
-import Comment from '@/components/comment/Comment.astro'
 import JsonLd from '@/components/JsonLd.astro'
 import TableOfContents from '@/components/navigation/TableOfContents.astro'
 import { integ } from '@/site-config'
@@ -117,8 +116,6 @@ const breadcrumbLd = {
     {lang === 'en' ? <CopyrightEn {data} /> : <Copyright {data} />}
     {/* Article recommend */}
     {recommend && <ArticleBottom collections={posts} {id} class='mt-3 sm:mt-6' />}
-    {/* Comments */}
-    {data.comment && <Comment class='mt-6' />}
   </Fragment>
 
   <slot name='bottom-sidebar' slot='bottom-sidebar' />

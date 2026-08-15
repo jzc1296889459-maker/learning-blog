@@ -37,7 +37,7 @@ const blogSchema = ({ image }: SchemaContext) =>
     tocDepth: z.number().int().min(2).max(6).optional(),
     tocLabels: z.record(z.string(), z.string()).optional(),
     draft: z.boolean().default(false),
-    comment: z.boolean().default(true)
+    comment: z.boolean().default(false)
   })
 
 const notesSchema = z.object({

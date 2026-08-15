@@ -16,7 +16,6 @@ Source: https://github.com/vercel/geist-font
 The following files contain icons from MingCute:
 
 - `public/icons/code.svg`
-- `public/icons/heart-item.svg`
 
 Copyright MingCute Design.
 

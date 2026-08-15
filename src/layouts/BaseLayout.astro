@@ -4,7 +4,6 @@ import { getLangFromUrl } from '@/i18n/ui'
 import { Footer } from 'astro-pure/components/basic'
 import type { SiteMeta } from 'astro-pure/types'
 import BaseHead from '@/components/BaseHead.astro'
-import ViewCounter from '@/components/comment/ViewCounter.astro'
 import Header from '@/components/Header.astro'
 import ThemeProvider from '@/components/ThemeProvider.astro'
 import config from '@/site-config'
@@ -51,8 +50,6 @@ const htmlLang = lang === 'en' ? 'en' : config.locale.lang
       <slot />
       {chrome && <Footer />}
     </div>
-
-    <ViewCounter />
 
     {/* Set highlight color */}
     <style define:vars={{ highlightColor }}>

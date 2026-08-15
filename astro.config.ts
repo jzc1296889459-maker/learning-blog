@@ -170,9 +170,7 @@ export default defineConfig({
         'linebreak',
         'base64-js',
         'unicode-trie',
-        'unicode-properties',
-        '@waline/client',
-        'recaptcha-v3'
+        'unicode-properties'
       ],
       esbuildOptions: {
         plugins: [
