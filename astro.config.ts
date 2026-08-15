@@ -3,7 +3,6 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { AstroIntegration } from 'astro'
 import { rehypeHeadingIds } from '@astrojs/markdown-remark'
-import react from '@astrojs/react'
 import sitemap from '@astrojs/sitemap'
 import vercel from '@astrojs/vercel'
 import AstroPureIntegration from 'astro-pure'
@@ -12,8 +11,6 @@ import rehypeKatex from 'rehype-katex'
 import remarkCjkFriendly from 'remark-cjk-friendly'
 import remarkMath from 'remark-math'
 
-// Others
-// import { visualizer } from 'rollup-plugin-visualizer'
 
 // Local integrations
 // Local rehype & remark plugins
@@ -104,8 +101,7 @@ export default defineConfig({
     exposeSingleSitemap(),
     // astro-pure will automatically add sitemap, mdx & unocss
     AstroPureIntegration(config),
-    bilingualReadingTime(),
-    react()
+    bilingualReadingTime()
   ],
   // root: './my-project-directory',
 
@@ -151,27 +147,7 @@ export default defineConfig({
     contentIntellisense: true
   },
   vite: {
-    plugins: [
-      //   visualizer({
-      //     emitFile: true,
-      //     filename: 'stats.html'
-      //   })
-    ],
-    resolve: {
-      dedupe: ['react', 'react-dom']
-    },
-    ssr: {
-      external: ['@resvg/resvg-js'],
-      noExternal: ['satori']
-    },
     optimizeDeps: {
-      include: [
-        'satori',
-        'linebreak',
-        'base64-js',
-        'unicode-trie',
-        'unicode-properties'
-      ],
       esbuildOptions: {
         plugins: [
           {
