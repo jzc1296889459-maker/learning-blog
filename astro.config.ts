@@ -26,6 +26,10 @@ import {
   updateStyle
 } from './src/plugins/shiki-transformers.ts'
 import config from './src/site.config.ts'
+const vercelProductionDomain = process.env.VERCEL_PROJECT_PRODUCTION_URL
+const siteUrl = vercelProductionDomain
+  ? `https://${vercelProductionDomain}`
+  : 'http://localhost:4321'
 
 const excludedSitemapPathPatterns = [
   /^\/(?:en\/)?404\/?$/,
@@ -65,7 +69,7 @@ const bilingualReadingTime = (): AstroIntegration => ({
 // https://astro.build/config
 export default defineConfig({
   // Top-Level Options
-  site: 'https://example.com',
+  site: siteUrl,
   // base: '/docs',
   trailingSlash: 'never',
 

@@ -50,7 +50,7 @@ Notes are stored under `src/content/notes/`.
 
 ## Before deployment
 
-- Replace the temporary `https://example.com` address in `astro.config.ts`.
+- Expose Vercel system environment variables and verify the production domain used for canonical URLs.
 - Confirm the site title, author, descriptions, and GitHub URL.
 - Confirm the favicon and all images are my own or properly licensed.
 - Keep Waline disabled unless I configure my own comment server.
