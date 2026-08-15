@@ -2,7 +2,7 @@
 import { Button } from 'astro-pure/user'
 import PageLayout from '@/layouts/BaseLayout.astro'
 
-// Catch-all for any /en/* path with no matching page (e.g. /en/talks, which
+// Catch-all for any /en/* path with no matching page (e.g. /en/unknown, which
 // has no English mirror). Without this, Vercel's routing falls back to the
 // root /404.html — the Chinese-locale 404 — instead of the English one.
 Astro.response.status = 404
