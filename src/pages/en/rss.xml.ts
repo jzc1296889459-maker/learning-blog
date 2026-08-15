@@ -83,7 +83,7 @@ const GET = async (context: AstroGlobal) => {
 
     // Contents
     title: `${config.title} (EN)`,
-    description: 'English posts — agents, LLM internals, and engineering notes.',
+    description: 'Study AI agents from zero.',
     site: `${import.meta.env.SITE}/en`,
     customData: '<language>en-us</language>',
     items: await Promise.all(
