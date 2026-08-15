@@ -1,5 +1,5 @@
 {/* 站内搜索：走 /api/search.json（terminal 的 search 命令同款后端），dev/prod 行为一致 */}
-<joye-site-search>
+<learning-blog-search>
   <aside class='form my-4'>
     <div id='local-site-search' class='local-search'>
       <input
@@ -15,7 +15,7 @@
       <ol id='local-search-results' class='local-search-results'></ol>
     </div>
   </aside>
-</joye-site-search>
+</learning-blog-search>
 
 <script>
   type LocalSearchResult = {
@@ -28,7 +28,7 @@
     excerpt: string
   }
 
-  class JoyeSiteSearch extends HTMLElement {
+  class LearningBlogSearch extends HTMLElement {
     connectedCallback() {
       if (this.dataset.ready === 'true') return
       this.dataset.ready = 'true'
@@ -108,8 +108,8 @@
     return li
   }
 
-  if (!customElements.get('joye-site-search')) {
-    customElements.define('joye-site-search', JoyeSiteSearch)
+  if (!customElements.get('learning-blog-search')) {
+    customElements.define('learning-blog-search', LearningBlogSearch)
   }
 </script>
 

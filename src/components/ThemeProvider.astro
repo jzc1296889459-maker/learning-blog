@@ -1,5 +1,5 @@
 <script is:inline>
-  (() => {
+  ;(() => {
     const DARK_COLOR = '#0B0B10'
     const LIGHT_COLOR = '#FCFCFD'
     const MEDIA_QUERY = '(prefers-color-scheme: dark)'
@@ -48,7 +48,7 @@
 
     applyTheme()
 
-    if (!window.__joyeThemeChangeListenerBound) {
+    if (!window.__learningBlogThemeChangeListenerBound) {
       const mediaQuery = window.matchMedia(MEDIA_QUERY)
       const handleThemeChange = () => {
         const storedTheme = getStoredTheme()
@@ -61,21 +61,21 @@
         mediaQuery.addEventListener('change', handleThemeChange)
       }
 
-      window.__joyeThemeChangeListenerBound = true
+      window.__learningBlogThemeChangeListenerBound = true
     }
 
-    if (!window.__joyeThemePageLoadListenerBound) {
+    if (!window.__learningBlogThemePageLoadListenerBound) {
       document.addEventListener('astro:page-load', () => {
         applyTheme()
       })
-      window.__joyeThemePageLoadListenerBound = true
+      window.__learningBlogThemePageLoadListenerBound = true
     }
 
-    if (!window.__joyeToastListenerBound) {
+    if (!window.__learningBlogToastListenerBound) {
       document.addEventListener('toast', (event) => {
         mountToast(event.detail?.message)
       })
-      window.__joyeToastListenerBound = true
+      window.__learningBlogToastListenerBound = true
     }
   })()
 </script>
