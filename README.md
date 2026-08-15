@@ -35,11 +35,10 @@ bun run check
 bun test
 ```
 
-Create and review a production build:
+Create a production build:
 
 ```shell
 bun run build:checked
-bun preview
 ```
 
 ## Content organization
@@ -53,10 +52,10 @@ Notes are stored under `src/content/notes/`.
 
 - Replace the temporary `https://example.com` address in `astro.config.ts`.
 - Confirm the site title, author, descriptions, and GitHub URL.
-- Replace the favicon and use only my own images and content.
+- Confirm the favicon and all images are my own or properly licensed.
 - Keep Waline disabled unless I configure my own comment server.
-- Decide whether Vercel Analytics and Speed Insights meet my privacy requirements.
-- Run `bun run build:checked` and review the result with `bun preview`.
+- Keep analytics disabled unless I deliberately configure a privacy-appropriate service.
+- Run `bun run build:checked` and review a Vercel preview deployment before publishing.
 - Check Chinese and English routes, language switching, dark mode, search, RSS,
   sitemap, canonical URLs, and the 404 page.
 - Confirm that no original author articles, images, QR codes, presentations,

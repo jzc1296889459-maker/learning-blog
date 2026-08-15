@@ -9,7 +9,6 @@
     "dev:check": "astro check --watch & astro dev",
     "build": "astro build",
     "build:checked": "bun run check && bun run build",
-    "preview": "astro preview",
     "sync": "astro sync",
     "check": "astro-pure check && astro check",
     "astro": "astro",

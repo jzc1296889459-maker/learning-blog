@@ -13,7 +13,7 @@ This Astro 5 blog uses TypeScript and Bun. Routes live in `src/pages/`; reusable
 - `bun run lint` applies ESLint fixes to source files.
 - `bun run format` formats JavaScript, TypeScript, Markdown, MDX, and Astro files.
 - `bun run build:checked` validates the project and creates a production build.
-- `bun preview` serves the production build locally for final review.
+- Vercel preview deployments are used for final production-like review because the Vercel adapter does not support Astro's local preview command.
 
 ## Coding Style & Naming Conventions
 
