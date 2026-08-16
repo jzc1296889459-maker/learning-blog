@@ -1,7 +1,7 @@
 ---
 title: 'Project 0: Building My Learning Blog'
 description: 'How I began turning an Astro template into my own Chinese-first bilingual learning blog.'
-publishDate: 2026-08-15
+publishDate: 2026-08-17
 tags:
   - project-zero
   - astro
@@ -31,6 +31,7 @@ I began with almost no programming or engineering experience, so building the we
 - Used Git to record and push each stage of the work
 - Deployed the website with Vercel and checked the production build
 - Configured the site address, canonical URLs, sitemap, and RSS
+- Established a workflow from drafting and branch previews to production publication
 
 ## What I have learned
 
@@ -52,6 +53,22 @@ Although all local checks and builds passed, the first Vercel deployment still f
 
 I fixed this by explicitly selecting Node.js 22 in `package.json`. This was my first practical example of how local and deployment environments can differ, and why deployment logs are important.
 
+## From draft to publication
+
+This blog uses Git branches and Vercel Preview deployments to reduce the risk of publishing mistakes.
+
+1. Keep the `main` branch as the version used by the production website.
+2. Create a new working branch for an article or website change.
+3. Edit the Chinese and English content locally, using `draft` to control whether the article is included in the build.
+4. Run the local website and check the content, layout, language switching, and links.
+5. Run the project checks, tests, and production build.
+6. Commit and push the working branch so Vercel creates a separate Preview website.
+7. Review the Preview and then merge the branch into `main` to trigger the production deployment.
+
+A published article can still be edited later through another branch. To temporarily remove an article, I can change `draft` back to `true` in both language versions and follow the same preview and merge workflow.
+
+This process taught me that writing and website changes can be versioned, checked, previewed, and released in the same way as code.
+
 ## Next steps
 
-The website has now completed its first deployment. Next, I will use a Git branch and Vercel Preview to test this article, continue editing the Home and About pages, and learn the complete workflow from draft to preview to publication.
+Project 0 has now covered the full process from preparing the website and completing its first deployment to previewing and publishing an article. Next, I will focus mainly on large language models, reasoning models, and reinforcement-learning foundations while continuing to document the learning process here.

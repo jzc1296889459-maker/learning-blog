@@ -3,11 +3,11 @@ import type { Config, IntegrationUserConfig, ThemeUserConfig } from 'astro-pure/
 export const theme: ThemeUserConfig = {
   // === Basic configuration ===
   /** Title for your website. Will be used in metadata and as browser tab title. */
-  title: 'My learning Blog',
+  title: 'My Learning Blog',
   /** Will be used in index page & copyright declaration */
   author: 'James',
   /** Description metadata for your website. Can be used in page metadata. */
-  description: '记录从零开始学习AI和Agent',
+  description: '记录我从零开始学习编程、人工智能和 AI Agent 的过程。',
   /** The default favicon for your site which should be a path to an image in the `public/` directory. */
   favicon: '/favicon/favicon.ico',
   /** Specify the default language for this site. */
