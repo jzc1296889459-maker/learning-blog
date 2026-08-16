@@ -8,7 +8,7 @@ tags:
   - learning
 language: 'en'
 translationKey: '20260815---project-zero-website/post'
-draft: true
+draft: false
 comment: false
 ---
 
@@ -25,10 +25,12 @@ I began with almost no programming or engineering experience, so building the we
 - Changed the site title, author, description, and GitHub links
 - Created a Chinese-first bilingual structure
 - Simplified the Home, About, Blog, and Notes pages
-- Removed the original author's articles, assets, and unused features
+- Removed the template's sample articles, assets, and features I do not currently need
 - Disabled comments, analytics, and database-related features
 - Reviewed licenses for fonts, icons, and third-party resources
 - Used Git to record and push each stage of the work
+- Deployed the website with Vercel and checked the production build
+- Configured the site address, canonical URLs, sitemap, and RSS
 
 ## What I have learned
 
@@ -44,6 +46,12 @@ When something breaks, error messages, file searches, and Git diffs usually reve
 
 After each related group of changes, I validate and commit the result. This makes it easier to identify the cause of a later problem.
 
+### Local success does not guarantee deployment success
+
+Although all local checks and builds passed, the first Vercel deployment still failed because of a Node.js version incompatibility. The deployment log showed that the older adapter did not recognize Node.js 24 and incorrectly fell back to the unsupported Node.js 18 runtime.
+
+I fixed this by explicitly selecting Node.js 22 in `package.json`. This was my first practical example of how local and deployment environments can differ, and why deployment logs are important.
+
 ## Next steps
 
-Next, I will test the post listings, language switching, tags, search, and RSS. Once those work correctly, I will prepare the site for deployment.
+The website has now completed its first deployment. Next, I will use a Git branch and Vercel Preview to test this article, continue editing the Home and About pages, and learn the complete workflow from draft to preview to publication.
