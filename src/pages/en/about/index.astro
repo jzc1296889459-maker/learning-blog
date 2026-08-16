@@ -5,7 +5,7 @@ import PageLayout from '@/layouts/BaseLayout.astro'
 <PageLayout
   meta={{
     title: 'About',
-    description: 'About James and this learning blog.'
+    description: 'About James, his learning focus, and this learning blog.'
   }}
   highlightColor='#659EB9'
 >
@@ -16,8 +16,9 @@ import PageLayout from '@/layouts/BaseLayout.astro'
       <h1 class='text-4xl font-semibold tracking-tight sm:text-5xl'>About this blog</h1>
 
       <p class='text-lg leading-8 text-muted-foreground'>
-        I’m James. I’m learning programming, artificial intelligence, and AI agents from zero. This
-        website is both a record of that journey and my first software-engineering project.
+        I’m James. I’m systematically learning programming, large language models, reasoning models,
+        and the foundations of reinforcement learning. This website records how I build
+        understanding through reading, hands-on implementation, and practical projects.
       </p>
     </header>
 
@@ -47,20 +48,22 @@ import PageLayout from '@/layouts/BaseLayout.astro'
     </section>
 
     <section class='flex flex-col gap-4'>
-      <h2 class='text-2xl font-semibold'>Current direction</h2>
+      <h2 class='text-2xl font-semibold'>Learning focus</h2>
 
       <div class='grid gap-4 sm:grid-cols-2'>
         <article class='rounded-xl border border-border bg-card p-5'>
-          <h3 class='font-semibold'>Project 0</h3>
+          <h3 class='font-semibold'>LLM and reasoning</h3>
           <p class='mt-2 text-sm leading-6 text-muted-foreground'>
-            Building, understanding, and publishing this bilingual learning blog.
+            Implementing model components from scratch to understand the foundations of language and
+            reasoning models.
           </p>
         </article>
 
         <article class='rounded-xl border border-border bg-card p-5'>
-          <h3 class='font-semibold'>Future projects</h3>
+          <h3 class='font-semibold'>RL</h3>
           <p class='mt-2 text-sm leading-6 text-muted-foreground'>
-            Learning AI, language models, and AI agents from their foundations.
+            Studying the core ideas of reinforcement learning and their relationship to model
+            training and decision-making.
           </p>
         </article>
       </div>
