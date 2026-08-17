@@ -1,0 +1,511 @@
+---
+title: 'From Text to Input Vectors: Chapter 2 Study Notes'
+description: 'A line-by-line study of GPT-2 tokenization, sliding windows, PyTorch data loading, and embeddings.'
+publishDate: 2026-08-17
+tags:
+  - llm
+  - pytorch
+  - tokenization
+  - book-notes
+language: 'en'
+translationKey: '20260817---llm-from-scratch-ch02-text-data/post'
+draft: true
+comment: false
+---
+
+> **Source note**
+>
+> This article is my study note following Chapter 2, “Working with Text Data,” of Sebastian Raschka’s [_Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch). The code comes from the book and its [official Chapter 2 companion code](https://github.com/rasbt/LLMs-from-scratch/tree/main/ch02/01_main-chapter-code). The code remains the author’s work and is distributed under the official repository’s Apache 2.0 license. This post does not replace the book; it records my own understanding of what each line does.
+
+This notebook begins in the latter part of Chapter 2. Its focus is converting a piece of text into the input that a language model can process. The entire pipeline can be condensed into one chain:
+
+```text
+raw text
+  → GPT-2 tokenizer
+  → token IDs
+  → sliding-window inputs and targets
+  → DataLoader batches
+  → token embeddings + positional embeddings
+  → input vectors for the LLM
+```
+
+This post only prepares the data. It does not train a language model yet.
+
+## 1. Downloading the sample text
+
+The chapter uses Edith Wharton’s short story _The Verdict_ as its sample text.
+
+```python
+import os
+import urllib.request
+
+if not os.path.exists("the-verdict.txt"):
+    url = ("https://raw.githubusercontent.com/rasbt/"
+           "LLMs-from-scratch/main/ch02/01_main-chapter-code/"
+           "the-verdict.txt")
+    file_path = "the-verdict.txt"
+    urllib.request.urlretrieve(url, file_path)
+```
+
+Line by line:
+
+- `import os` loads Python’s operating-system utilities. Here it is used to check whether a file already exists.
+- `import urllib.request` loads a networking utility that can download a file from a URL.
+- `os.path.exists("the-verdict.txt")` returns a Boolean: `True` when the file exists and `False` when it does not.
+- `not` reverses that result. The indented download code therefore runs only when the file is missing.
+- Python automatically joins the three adjacent strings inside the parentheses into one URL. Splitting the URL over several lines only improves readability.
+- `file_path` stores the local filename.
+- `urlretrieve(url, file_path)` downloads the content at `url` and writes it to `file_path`.
+
+The original study notebook had lost indentation in this cell. The version above restores the indentation from the author’s official Chapter 2 notebook. This does not change the algorithm; it ensures that `url`, `file_path`, and the download operation all belong to the “file does not exist” branch. If the download call stays outside the `if` block, `url` may be undefined when the file already exists, causing a `NameError`.
+
+## 2. Creating the GPT-2 tokenizer
+
+```python
+import tiktoken
+```
+
+`tiktoken` is OpenAI’s fast tokenization library. A language model cannot perform matrix operations directly on strings, so the text must first be split into tokens and each token must be mapped to an integer ID.
+
+```python
+tiktoken.__version__
+```
+
+Output:
+
+```text
+'0.13.0'
+```
+
+`__version__` stores the installed version. Jupyter automatically displays a value placed on the final line of a cell. In a normal `.py` file, we would usually write `print(tiktoken.__version__)` instead.
+
+```python
+tokenizer = tiktoken.get_encoding("gpt2")
+```
+
+- `get_encoding("gpt2")` loads the Byte Pair Encoding (BPE) rules and vocabulary used by GPT-2.
+- `tokenizer` is not a language model. It makes no predictions; it only converts between text and token IDs.
+- A token ID is simply an index in a vocabulary. A larger ID does not mean that the token is more important.
+
+## 3. Encoding text as token IDs
+
+```python
+with open("the-verdict.txt", "r", encoding="utf-8") as f:
+    raw_text = f.read()
+
+encoded_text = tokenizer.encode(raw_text)
+print(len(encoded_text))
+```
+
+Output:
+
+```text
+5145
+```
+
+Three changes in representation happen here:
+
+1. `open(..., "r", encoding="utf-8")` opens the UTF-8 text file in read-only mode.
+2. `f.read()` reads the whole file into a Python string named `raw_text`.
+3. `tokenizer.encode(raw_text)` converts that string into a list of integers named `encoded_text`.
+
+The `with` statement closes the file automatically at the end of the block, even if reading raises an exception, so there is no need to call `f.close()` manually. The final `len(encoded_text)` measures the number of **tokens**, not characters or words. A BPE token may be a complete word, part of a word, punctuation, or a piece that includes a leading space.
+
+## 4. Understanding the “next token” target
+
+```python
+enc_sample = encoded_text[50:]
+context_size = 4
+x = enc_sample[:context_size]
+y = enc_sample[1:context_size + 1]
+
+print(f"x: {x}")
+print(f"y:      {y}")
+```
+
+Output:
+
+```text
+x: [290, 4920, 2241, 287]
+y:      [4920, 2241, 287, 257]
+```
+
+- `encoded_text[50:]` skips the first 50 tokens simply to select a convenient demonstration passage.
+- `context_size = 4` means the model will receive four tokens at a time.
+- `x` takes tokens at positions `0` through `3`.
+- `y` starts at position `1` and also takes four tokens.
+
+Using abstract token symbols makes the relationship clear:
+
+| Position | 0     | 1     | 2     | 3     | 4     |
+| -------- | ----- | ----- | ----- | ----- | ----- |
+| Token    | $t_0$ | $t_1$ | $t_2$ | $t_3$ | $t_4$ |
+| `x`      | $t_0$ | $t_1$ | $t_2$ | $t_3$ |       |
+| `y`      |       | $t_1$ | $t_2$ | $t_3$ | $t_4$ |
+
+`y` is therefore `x` shifted one position to the right. At each position, the model will learn that the correct next token is the value in the corresponding position of `y`.
+
+### Decoding IDs into readable text
+
+```python
+for i in range(1, context_size + 1):
+    context = enc_sample[:i]
+    desired = enc_sample[i]
+    print(tokenizer.decode(context), "->", tokenizer.decode([desired]))
+```
+
+Output:
+
+```text
+ and ->  established
+ and established ->  himself
+ and established himself ->  in
+ and established himself in ->  a
+```
+
+- `range(1, context_size + 1)` produces `1, 2, 3, 4`. Python excludes the ending value of a `range`, which is why the code needs `+ 1`.
+- `enc_sample[:i]` grows the context from one token to four tokens.
+- `enc_sample[i]` selects the token immediately after the current context.
+- `decode(context)` converts multiple token IDs back into text.
+- `decode([desired])` expects a list of IDs, so the single integer `desired` is placed inside brackets.
+
+The output says: given the growing context on the left, the desired prediction is the token on the right of the arrow.
+
+### Viewing the same relationship as numbers
+
+```python
+for i in range(1, context_size + 1):
+    context = enc_sample[:i]
+    desired = enc_sample[i]
+    print(f" {context} -> {desired}")
+```
+
+Output:
+
+```text
+ [290] -> 4920
+ [290, 4920] -> 2241
+ [290, 4920, 2241] -> 287
+ [290, 4920, 2241, 287] -> 257
+```
+
+This loop does not change the data. It only skips decoding, helping connect the readable text with the integers that the model actually receives.
+
+## 5. Building sliding windows with a PyTorch Dataset
+
+```python
+import torch
+```
+
+PyTorch supplies tensors, data batches, and the neural-network operations used later.
+
+```python
+torch.__version__
+```
+
+Output:
+
+```text
+'2.13.0+cpu'
+```
+
+Like `tiktoken.__version__`, this records the experiment environment. Version information can help diagnose differences between computers.
+
+```python
+from torch.utils.data import Dataset, DataLoader
+
+class GPTDatasetV1(Dataset):
+    def __init__(self, text, tokenizer, max_length, stride):
+        self.input_ids = []
+        self.target_ids = []
+
+        token_ids = tokenizer.encode(text, allowed_special={"<|endoftext|>"})
+
+        for i in range(0, len(token_ids) - max_length, stride):
+            input_seq = token_ids[i:i + max_length]
+            target_seq = token_ids[i + 1:i + max_length + 1]
+
+            self.input_ids.append(torch.tensor(input_seq, dtype=torch.long))
+            self.target_ids.append(torch.tensor(target_seq, dtype=torch.long))
+
+    def __len__(self):
+        return len(self.input_ids)
+
+    def __getitem__(self, idx):
+        return self.input_ids[idx], self.target_ids[idx]
+```
+
+### The class and its initializer
+
+- `class GPTDatasetV1(Dataset)` defines a custom dataset that inherits from PyTorch’s `Dataset`. This inheritance gives `DataLoader` a standard way to request samples.
+- `__init__` runs when a dataset object is created.
+- `text` is the complete string; `tokenizer` performs encoding; `max_length` is the number of tokens in each sample; and `stride` is the distance the window moves each time.
+- `self.input_ids` and `self.target_ids` are lists that store all input and target sequences.
+
+### Encoding the complete text once
+
+```python
+token_ids = tokenizer.encode(text, allowed_special={"<|endoftext|>"})
+```
+
+The complete text is encoded once. `allowed_special` tells the tokenizer that if the literal text `<|endoftext|>` appears, it may be treated as GPT-2’s special token instead of raising an error. It does not automatically add that token to the text.
+
+### Moving the window
+
+```python
+for i in range(0, len(token_ids) - max_length, stride):
+```
+
+- The first window begins at `0`.
+- The endpoint ensures that at least one extra token remains after an input window because the target is shifted right by one.
+- Each iteration advances by `stride`, which controls the overlap between adjacent samples.
+
+For example, with `max_length=4` and `stride=2`, windows begin at `0, 2, 4, ...`, so neighboring inputs overlap by two tokens. With `stride=4`, the input windows do not overlap.
+
+```python
+input_seq = token_ids[i:i + max_length]
+target_seq = token_ids[i + 1:i + max_length + 1]
+```
+
+These two lines apply the earlier small example across the whole text. The input begins at `i`, the target begins at `i + 1`, and both sequences have the same length.
+
+```python
+self.input_ids.append(torch.tensor(input_seq, dtype=torch.long))
+self.target_ids.append(torch.tensor(target_seq, dtype=torch.long))
+```
+
+- `torch.tensor(...)` converts a Python list of integers into a PyTorch tensor.
+- `dtype=torch.long` selects 64-bit integers. A PyTorch embedding layer requires integer indices; ordinary floating-point values cannot serve as token IDs.
+- `append` stores the current window in the dataset.
+
+### Making the dataset readable by DataLoader
+
+- `__len__` returns the number of samples, enabling `len(dataset)`.
+- `__getitem__(idx)` returns the `(input, target)` pair at position `idx`, enabling `dataset[0]`.
+- Names surrounded by double underscores are Python special methods. `DataLoader` calls them behind the scenes.
+
+## 6. Grouping samples into batches
+
+```python
+def create_dataloader_v1(text, batch_size=2, max_length=256,
+                         stride=128, shuffle=True, drop_last=True,
+                         num_workers=0):
+    tokenizer = tiktoken.get_encoding("gpt2")
+    dataset = GPTDatasetV1(text, tokenizer, max_length, stride)
+    dataloader = DataLoader(dataset,
+                            batch_size=batch_size,
+                            shuffle=shuffle,
+                            drop_last=drop_last,
+                            num_workers=num_workers)
+    return dataloader
+```
+
+This function packages tokenizer, dataset, and DataLoader creation into one operation:
+
+- `batch_size`: how many samples are returned together.
+- `max_length`: how many tokens each sample contains, also called the context length.
+- `stride`: how many tokens the sliding window advances.
+- `shuffle`: whether sample order is randomized each epoch. It is commonly enabled for training and disabled when inspecting a fixed example.
+- `drop_last`: whether to discard the final batch when it contains fewer than `batch_size` samples. Fixed-size batches are often easier to train with.
+- `num_workers=0`: load data in the current Python process. This is the simplest setting and works well in notebooks and on Windows.
+- `return dataloader`: gives the completed loader back to the caller.
+
+## 7. Retrieving one batch
+
+```python
+with open("the-verdict.txt", "r", encoding="utf-8") as f:
+    raw_text = f.read()
+```
+
+The text is loaded again so that this experiment section can run independently.
+
+```python
+dataloader = create_dataloader_v1(
+    raw_text,
+    batch_size=8,
+    max_length=4,
+    stride=4,
+    shuffle=False,
+    drop_last=True,
+    num_workers=0
+)
+data_iter = iter(dataloader)
+input, target = next(data_iter)
+print(f"Input:\n", input)
+print(f"Target:\n", target)
+```
+
+Output:
+
+```text
+Input:
+ tensor([[   40,   367,  2885,  1464],
+        [ 1807,  3619,   402,   271],
+        [10899,  2138,   257,  7026],
+        [15632,   438,  2016,   257],
+        [  922,  5891,  1576,   438],
+        [  568,   340,   373,   645],
+        [ 1049,  5975,   284,   502],
+        [  284,  3285,   326,    11]])
+Target:
+ tensor([[  367,  2885,  1464,  1807],
+        [ 3619,   402,   271, 10899],
+        [ 2138,   257,  7026, 15632],
+        [  438,  2016,   257,   922],
+        [ 5891,  1576,   438,   568],
+        [  340,   373,   645,  1049],
+        [ 5975,   284,   502,   284],
+        [ 3285,   326,    11,   287]])
+```
+
+- `batch_size=8` puts eight sequences in one batch.
+- `max_length=4` puts four tokens in each sequence.
+- `stride=4` prevents neighboring input windows from overlapping.
+- `shuffle=False` keeps the original text order, making inspection easier.
+- `iter(dataloader)` creates an iterator.
+- `next(data_iter)` retrieves the first batch and unpacks it into inputs and targets.
+
+Both `input` and `target` therefore have shape `[8, 4]`: the first dimension is batch size and the second is sequence length. The name `input` shadows Python’s built-in `input()` function. That does not break this example, but `inputs` would be clearer in a larger project.
+
+Each target row remains its matching input row shifted by one token:
+
+```text
+input:  [t0, t1, t2, t3]
+target: [t1, t2, t3, t4]
+```
+
+## 8. Mapping token IDs to vectors
+
+```python
+dir(tokenizer)
+```
+
+`dir` lists the attributes and methods available on an object. It is useful for exploring Python objects, although its output is long. The attribute needed below is `n_vocab`.
+
+```python
+torch.manual_seed(123)
+vocab_size = tokenizer.n_vocab
+output_dim = 256
+embedding_layer = torch.nn.Embedding(
+    num_embeddings=vocab_size,
+    embedding_dim=output_dim
+)
+```
+
+- `torch.manual_seed(123)` fixes PyTorch’s random seed, making the random initialization easier to reproduce across runs.
+- `tokenizer.n_vocab` is the GPT-2 vocabulary size, which determines how many rows the embedding table needs.
+- `output_dim=256` represents each token with 256 floating-point values.
+- `torch.nn.Embedding` creates a trainable lookup table with shape `[vocab_size, output_dim]`.
+
+```python
+print(embedding_layer.weight.shape)
+```
+
+Output:
+
+```text
+torch.Size([50257, 256])
+```
+
+`weight` is the embedding layer’s parameter matrix. Passing in a token ID is equivalent to retrieving the corresponding row. These values are random when the layer is created; they only become useful representations through training.
+
+```python
+token_embeddings = embedding_layer(input)
+token_embeddings.shape
+```
+
+Output:
+
+```text
+torch.Size([8, 4, 256])
+```
+
+The token ID input has shape `[8, 4]`. Replacing every ID with a 256-dimensional vector produces `[8, 4, 256]`:
+
+| Dimension | Meaning                     | Current value |
+| --------- | --------------------------- | ------------- |
+| First     | Sequences in one batch      | 8             |
+| Second    | Tokens in each sequence     | 4             |
+| Third     | Values in each token vector | 256           |
+
+## 9. Adding position information
+
+A token embedding depends only on the token ID. The same token receives the same vector whether it appears first or fourth. The model therefore needs separate information about each token’s position in the sequence.
+
+```python
+context_length = 4
+pos_embedding_layer = torch.nn.Embedding(
+    num_embeddings=context_length,
+    embedding_dim=output_dim
+)
+pos_embeddings = pos_embedding_layer(torch.arange(context_length))
+```
+
+- `context_length=4` matches the current sequence length.
+- The positional embedding table has four rows representing positions `0, 1, 2, 3`.
+- Each position vector also has 256 dimensions, allowing it to be added to a token embedding.
+- `torch.arange(context_length)` creates the integer tensor `[0, 1, 2, 3]`.
+- Passing those position indices into the embedding layer retrieves four position vectors.
+
+```python
+pos_embeddings.shape
+```
+
+Output:
+
+```text
+torch.Size([4, 256])
+```
+
+The result is `[4, 256]`: four positions with one 256-dimensional vector per position.
+
+```python
+input_embeddings = token_embeddings + pos_embeddings
+input_embeddings.shape
+```
+
+Output:
+
+```text
+torch.Size([8, 4, 256])
+```
+
+The two tensor shapes initially appear different:
+
+```text
+token_embeddings: [8, 4, 256]
+pos_embeddings:       [4, 256]
+```
+
+PyTorch uses **broadcasting** to apply the same `[4, 256]` positional vectors to all eight sequences in the batch. The result therefore remains `[8, 4, 256]`.
+
+Each combined vector now carries two kinds of information:
+
+- the token embedding represents “which token is this?”;
+- the positional embedding represents “where is it in the sequence?”
+
+This `input_embeddings` tensor is what the later Transformer blocks will receive.
+
+## 10. Final understanding
+
+The central lesson is not memorizing APIs; it is following the changing data representations and shapes:
+
+| Stage                  | Example representation                | Shape                 |
+| ---------------------- | ------------------------------------- | --------------------- |
+| Raw text               | Python string                         | No fixed tensor shape |
+| Token IDs              | One integer per token                 | `[total token count]` |
+| One input batch        | Eight sequences of four tokens        | `[8, 4]`              |
+| Token embeddings       | One 256-dimensional vector per ID     | `[8, 4, 256]`         |
+| Positional embeddings  | One vector for each of four positions | `[4, 256]`            |
+| Final input embeddings | Token and position vectors added      | `[8, 4, 256]`         |
+
+My current understanding is that the training target comes directly from the text. We do not need a human to label every word. Copying the sequence and shifting it by one token creates the correct next-token answer at every position. The embedding layers then turn discrete IDs into continuous vectors that neural networks can process.
+
+The next step is to pass these input vectors into attention mechanisms so that the model can learn relationships between positions in a sequence.
+
+## References
+
+- [Sebastian Raschka, _Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch)
+- [Chapter 2: Working with Text Data](https://livebook.manning.com/book/build-a-large-language-model-from-scratch/chapter-2)
+- [Official LLMs-from-scratch GitHub repository](https://github.com/rasbt/LLMs-from-scratch)
+- [Official Chapter 2 notebook](https://github.com/rasbt/LLMs-from-scratch/blob/main/ch02/01_main-chapter-code/ch02.ipynb)
