@@ -1,0 +1,572 @@
+---
+title: 'Assembling a GPT Model: Chapter 4 Study Notes'
+description: 'Building a GPT-2 small-style architecture from LayerNorm, GELU, residual paths, and Transformer blocks.'
+publishDate: 2026-08-17
+tags:
+  - llm
+  - pytorch
+  - transformer
+  - book-notes
+language: 'en'
+translationKey: '20260817---llm-from-scratch-ch04-gpt-model/post'
+draft: true
+comment: false
+---
+
+> **Source note**
+>
+> This article is my study note following Chapter 4, “Implementing a GPT Model from Scratch to Generate Text,” of Sebastian Raschka’s [_Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch). The code comes from the book and its [official Chapter 4 companion code](https://github.com/rasbt/LLMs-from-scratch/tree/main/ch04/01_main-chapter-code). The code remains the author’s work and is distributed under the official repository’s Apache 2.0 license. This post does not replace the book; it records how I understand each component and the tensor flow through the complete model.
+
+Chapter 3 implemented multi-head causal attention. Chapter 4 combines it with the remaining pieces of a GPT model:
+
+```text
+token IDs
+  → token embeddings + positional embeddings
+  → 12 Transformer blocks
+       ├── LayerNorm → causal attention → residual connection
+       └── LayerNorm → feed-forward network → residual connection
+  → final LayerNorm
+  → vocabulary logits
+```
+
+This is a GPT-2 small-style architecture, but its weights are still randomly initialized. It has not been trained.
+
+## 1. Model configuration
+
+```python
+GPT_CONFIG_124M = {
+    "vocab_size": 50257,       # Vocabulary size
+    "context_length": 1024,    # Context length
+    "emb_dim": 768,            # Embedding dimension
+    "n_heads": 12,             # Number of attention heads
+    "n_layers": 12,            # Number of layers
+    "drop_rate": 0.1,          # Dropout rate
+    "qkv_bias": False,         # Query-Key-Value bias
+}
+```
+
+| Setting          | Meaning                                                     |
+| ---------------- | ----------------------------------------------------------- |
+| `vocab_size`     | The GPT-2 tokenizer contains 50,257 tokens                  |
+| `context_length` | The model accepts at most 1,024 positions at once           |
+| `emb_dim`        | Every token is represented internally by 768 values         |
+| `n_heads`        | Each attention layer has 12 heads of 64 dimensions          |
+| `n_layers`       | The model stacks 12 Transformer blocks                      |
+| `drop_rate`      | Dropout removes values with 10% probability during training |
+| `qkv_bias`       | Query, key, and value projections do not use bias           |
+
+The dictionary keeps every component on the same dimensions without repeating constants across classes.
+
+## 2. LayerNorm
+
+```python
+import torch
+import torch.nn as nn
+
+class LayerNorm(nn.Module):
+    def __init__(self, emb_dim):
+        super().__init__()
+        self.eps = 1e-5
+        self.scale = nn.Parameter(torch.ones(emb_dim))
+        self.shift = nn.Parameter(torch.zeros(emb_dim))
+
+    def forward(self, x):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        norm_x = (x - mean) / torch.sqrt(var + self.eps)
+        return self.scale * norm_x + self.shift
+```
+
+Step by step:
+
+- `dim=-1` calculates statistics only across the embedding dimension. Tokens and batch items are not mixed.
+- `keepdim=True` retains a final dimension of length one so the result broadcasts back over `x`.
+- `unbiased=False` calculates population variance, matching LayerNorm’s definition.
+- `x - mean` centers each token’s features near zero.
+- Dividing by the standard deviation makes variance approximately one.
+- `eps` prevents division by zero.
+- `scale` and `shift` are trainable, allowing the model to rescale and reposition normalized values when useful.
+
+LayerNorm changes value distribution without changing tensor shape.
+
+## 3. GELU activation
+
+```python
+class GELU(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return 0.5 * x * (
+            1 + torch.tanh(
+                torch.sqrt(torch.tensor(2.0 / torch.pi))
+                * (x + 0.044715 * torch.pow(x, 3))
+            )
+        )
+```
+
+GELU is a smooth activation. ReLU sets every negative value to zero, whereas GELU smoothly preserves part of a negative input depending on its magnitude. This code uses the tanh approximation:
+
+- `torch.pow(x, 3)` calculates the cubic term.
+- `0.044715` is a constant in the approximation.
+- `torch.tanh` creates a smooth S-shaped transition.
+- The outer `0.5 * x` makes the final response continuous.
+
+The notebook also plots GELU and ReLU:
+
+```python
+import matplotlib.pyplot as plt
+
+gelu, relu = GELU(), nn.ReLU()
+x = torch.linspace(-3, 3, 100)
+y_gelu, y_relu = gelu(x), relu(x)
+
+plt.figure(figsize=(8, 3))
+for i, (y, label) in enumerate(
+    zip([y_gelu, y_relu], ["GELU", "ReLU"]), 1
+):
+    plt.subplot(1, 2, i)
+    plt.plot(x, y)
+    plt.title(label)
+    plt.grid(True)
+plt.tight_layout()
+plt.show()
+```
+
+The important visual difference is that ReLU has a corner at zero and removes all negative inputs. GELU is smooth and retains a small amount of information for negative inputs near zero.
+
+## 4. Feed-forward network
+
+```python
+class FeedForward(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(cfg["emb_dim"], 4 * cfg["emb_dim"]),
+            GELU(),
+            nn.Linear(4 * cfg["emb_dim"], cfg["emb_dim"]),
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+```
+
+This network processes every token independently:
+
+1. The first layer expands the final dimension from 768 to 3,072.
+2. GELU introduces nonlinearity. Without it, two linear layers would still be equivalent to one linear transformation.
+3. The second layer contracts 3,072 back to 768.
+
+Input and output can therefore both have shape `[batch, tokens, 768]`. `nn.Linear` operates on the final dimension and preserves the leading batch and token dimensions.
+
+## 5. Why residual connections matter
+
+A residual connection changes `y = F(x)` into:
+
+```text
+y = x + F(x)
+```
+
+Even when gradients through `F` become small, `x` provides a direct path through which gradients can reach earlier layers.
+
+The notebook compares a small deep network with and without shortcuts:
+
+```python
+class ExampleDNN(nn.Module):
+    def __init__(self, layer_sizes, use_shortcut):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(layer_sizes[0], layer_sizes[1]),
+                    GELU(),
+                ),
+                nn.Sequential(
+                    nn.Linear(layer_sizes[1], layer_sizes[2]),
+                    GELU(),
+                ),
+                nn.Sequential(
+                    nn.Linear(layer_sizes[2], layer_sizes[3]),
+                    GELU(),
+                ),
+                nn.Sequential(
+                    nn.Linear(layer_sizes[3], layer_sizes[4]),
+                    GELU(),
+                ),
+                nn.Sequential(
+                    nn.Linear(layer_sizes[4], layer_sizes[5]),
+                    GELU(),
+                ),
+            ]
+        )
+        self.use_shortcut = use_shortcut
+
+    def forward(self, x):
+        for layer in self.layers:
+            layer_output = layer(x)
+            if self.use_shortcut and x.shape == layer_output.shape:
+                x = x + layer_output
+            else:
+                x = layer_output
+        return x
+```
+
+The `x.shape == layer_output.shape` condition matters because elementwise addition requires matching sizes. The final layer changes three features into one, so it cannot use that shortcut.
+
+This helper performs a forward pass, mean-squared-error calculation, backpropagation, and then prints the mean absolute gradient of each weight:
+
+```python
+def print_gradients(model, x):
+    output = model(x)
+    target = torch.tensor([0.])
+
+    loss = nn.MSELoss()
+    loss = loss(output, target)
+    loss.backward()
+
+    for name, param in model.named_parameters():
+        if "weight" in name:
+            print(
+                f"{name}: {param.grad.abs().mean().item()}"
+            )
+```
+
+Without shortcuts:
+
+```text
+layers.0.0.weight: 0.0006052075768820941
+layers.1.0.weight: 0.00036033481592312455
+layers.2.0.weight: 0.0021456123795360327
+layers.3.0.weight: 0.004196621477603912
+layers.4.0.weight: 0.015148940496146679
+```
+
+With shortcuts:
+
+```text
+layers.0.0.weight: 0.22169791162014008
+layers.1.0.weight: 0.20694105327129364
+layers.2.0.weight: 0.32896989583969116
+layers.3.0.weight: 0.2665732204914093
+layers.4.0.weight: 1.3258541822433472
+```
+
+In this demonstration, the earlier layers receive much larger gradients, illustrating how a direct path reduces repeated gradient shrinkage. This example does not mean residual connections guarantee that gradients can never vanish or explode.
+
+## 6. Transformer block
+
+The multi-head attention class from Chapter 3 is stored in `attention.py`:
+
+```python
+from attention import MultiHeadAttention
+```
+
+A complete block contains two major sublayers: attention and feed-forward. Each is preceded by LayerNorm and followed by dropout and a residual connection.
+
+```python
+class TransformerBlock(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.att = MultiHeadAttention(
+            d_in=cfg["emb_dim"],
+            d_out=cfg["emb_dim"],
+            context_length=cfg["context_length"],
+            num_heads=cfg["n_heads"],
+            dropout=cfg["drop_rate"],
+            qkv_bias=cfg["qkv_bias"],
+        )
+        self.ff = FeedForward(cfg)
+        self.norm1 = LayerNorm(cfg["emb_dim"])
+        self.norm2 = LayerNorm(cfg["emb_dim"])
+        self.dropout_shortcut = nn.Dropout(cfg["drop_rate"])
+
+    def forward(self, x):
+        shortcut = x
+        x = self.norm1(x)
+        x = self.att(x)
+        x = self.dropout_shortcut(x)
+        x = x + shortcut
+
+        shortcut = x
+        x = self.norm2(x)
+        x = self.ff(x)
+        x = self.dropout_shortcut(x)
+        x = x + shortcut
+        return x
+```
+
+The first half lets tokens gather information from earlier positions through causal attention. The second half transforms each token’s 768 features through the feed-forward network. Both shortcuts require the sublayers to preserve shape.
+
+```python
+block = TransformerBlock(GPT_CONFIG_124M)
+
+torch.manual_seed(123)
+x = torch.rand(2, 4, 768)
+output = block(x)
+print(x.shape)
+print(output.shape)
+```
+
+```text
+torch.Size([2, 4, 768])
+torch.Size([2, 4, 768])
+```
+
+A block changes the values but preserves the external `[batch, tokens, embedding]` shape, allowing 12 blocks to be stacked.
+
+## 7. Complete GPT model
+
+```python
+class GPTModel(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.tok_emb = nn.Embedding(
+            cfg["vocab_size"], cfg["emb_dim"]
+        )
+        self.pos_emb = nn.Embedding(
+            cfg["context_length"], cfg["emb_dim"]
+        )
+        self.drop_emb = nn.Dropout(cfg["drop_rate"])
+
+        self.trf_blocks = nn.Sequential(
+            *[
+                TransformerBlock(cfg)
+                for _ in range(cfg["n_layers"])
+            ]
+        )
+        self.final_norm = LayerNorm(cfg["emb_dim"])
+        self.out_head = nn.Linear(
+            cfg["emb_dim"], cfg["vocab_size"], bias=False
+        )
+
+    def forward(self, in_idx):
+        batch_size, seq_len = in_idx.shape
+        tok_embeds = self.tok_emb(in_idx)
+        pos_embeds = self.pos_emb(
+            torch.arange(seq_len, device=in_idx.device)
+        )
+
+        x = tok_embeds + pos_embeds
+        x = self.drop_emb(x)
+        x = self.trf_blocks(x)
+        x = self.final_norm(x)
+        logits = self.out_head(x)
+        return logits
+```
+
+### During initialization
+
+- `tok_emb` maps every token ID to a 768-dimensional vector.
+- `pos_emb` stores a vector for positions 0 through 1,023.
+- The list comprehension creates 12 independent `TransformerBlock` instances.
+- The leading `*` expands that list into positional arguments for `nn.Sequential`.
+- `final_norm` normalizes once more before the output head.
+- `out_head` projects each 768-dimensional vector to 50,257 vocabulary positions.
+
+### During the forward pass
+
+Input `in_idx` has shape `[B, T]`. Token and positional embeddings produce `[B, T, 768]`. The blocks preserve that shape, and the output head finally produces `[B, T, 50257]`.
+
+`device=in_idx.device` keeps the position indices on the same CPU or GPU as the input and prevents a device mismatch.
+
+## 8. Testing with two short sentences
+
+```python
+import tiktoken
+
+tokenizer = tiktoken.get_encoding("gpt2")
+batch = []
+txt1 = "Every effort moves you"
+txt2 = "Every day holds a"
+batch.append(torch.tensor(tokenizer.encode(txt1)))
+batch.append(torch.tensor(tokenizer.encode(txt2)))
+batch = torch.stack(batch, dim=0)
+print(batch)
+```
+
+```text
+tensor([[6109, 3626, 6100,  345],
+        [6109, 1110, 6622,  257]])
+```
+
+Both sentences happen to encode to four tokens, so they can be stacked directly into `[2, 4]`. Different lengths would require a padding or batching strategy in real training.
+
+```python
+torch.manual_seed(123)
+model = GPTModel(GPT_CONFIG_124M)
+out = model(batch)
+print("Output shape:", out.shape)
+print(out)
+```
+
+```text
+Output shape: torch.Size([2, 4, 50257])
+tensor([[[ 4.1593e-01,  2.8493e-01, -8.1283e-02,  ...,  1.3853e-01,
+          -9.3770e-04, -5.9128e-01],
+         ...,
+         [-1.2726e+00,  1.9112e-01, -4.3017e-01,  ...,  9.5809e-01,
+           1.9775e-01, -7.2380e-01]],
+
+        [[ 3.6637e-01,  8.8838e-02, -3.8053e-01,  ..., -6.8561e-02,
+           1.2058e-01, -3.2590e-01],
+         ...,
+         [ 1.3891e-01,  2.8607e-01,  5.0605e-01,  ...,  5.9626e-01,
+          -4.4778e-01, -2.3845e-01]]],
+       grad_fn=<UnsafeViewBackward0>)
+```
+
+An important distinction: these 50,257 numbers are **logits**, not probabilities. Logits may be any real values and do not sum to one. Applying softmax across the final dimension converts them into a vocabulary probability distribution.
+
+## 9. Parameter count and weight tying
+
+```python
+total_params = sum(p.numel() for p in model.parameters())
+print(
+    f"Total number of parameters in the model: {total_params}"
+)
+```
+
+```text
+Total number of parameters in the model: 163009536
+```
+
+Why does a configuration named 124M produce roughly 163M parameters? The current code creates two independent large matrices:
+
+- token embeddings: `50257 × 768`;
+- output head: `768 × 50257`.
+
+Original GPT-2 uses **weight tying**, making the output head reuse the token embedding weights. The notebook displays the remaining size by subtracting the output-head parameters:
+
+```python
+total_params_gpt2 = (
+    total_params
+    - sum(p.numel() for p in model.out_head.parameters())
+)
+print(
+    "Total number of parameters in the GPT-2 model:",
+    total_params_gpt2
+)
+```
+
+```text
+Total number of parameters in the GPT-2 model: 124412160
+```
+
+Strictly speaking, the current `GPTModel` has **not actually tied those weights**, so this object really contains about 163M independent parameters. The 124M figure estimates the GPT-2-style count after removing the duplicated output matrix.
+
+With 32-bit floating-point parameters at four bytes each:
+
+```python
+total_size_bytes = total_params * 4
+total_size_mb = total_size_bytes / (1024 * 1024)
+print("Total size of the model in MB:", total_size_mb)
+```
+
+```text
+Total size of the model in MB: 621.83203125
+```
+
+This counts parameters only. Training also needs gradients, optimizer state, and intermediate activations, so actual memory consumption is higher.
+
+## 10. Autoregressive text generation
+
+```python
+def generate_text_simple(
+    model, idx, max_new_tokens, context_size
+):
+    for _ in range(max_new_tokens):
+        idx_cond = idx[:, -context_size:]
+
+        with torch.no_grad():
+            logits = model(idx_cond)
+
+        logits = logits[:, -1, :]
+        probs = torch.softmax(logits, dim=-1)
+        idx_next = torch.argmax(
+            probs, dim=-1, keepdim=True
+        )
+        idx = torch.cat((idx, idx_next), dim=1)
+
+    return idx
+```
+
+Each loop iteration generates one token:
+
+1. `idx[:, -context_size:]` retains only the most recent tokens that fit within the model’s context.
+2. `torch.no_grad()` disables gradient recording to reduce inference memory.
+3. The model returns logits for all input positions.
+4. `logits[:, -1, :]` selects the final position, which predicts the next token.
+5. Softmax converts those logits to probabilities.
+6. `argmax` chooses the highest-probability token, known as greedy decoding.
+7. `torch.cat` appends that token, and the next iteration uses the longer sequence.
+
+Softmax does not change which element is largest, so greedy generation could apply `argmax` directly to logits. It remains here to make the probability step explicit.
+
+```python
+start_context = "Hello, I am"
+encoded = tokenizer.encode(start_context)
+print("encoded:", encoded)
+
+encoded_tensor = torch.tensor(encoded).unsqueeze(0)
+print("encoded_tensor.shape:", encoded_tensor.shape)
+```
+
+```text
+encoded: [15496, 11, 314, 716]
+encoded_tensor.shape: torch.Size([1, 4])
+```
+
+`unsqueeze(0)` adds a leading batch dimension, changing `[4]` into `[1, 4]`.
+
+```python
+model.eval()
+out = generate_text_simple(
+    model=model,
+    idx=encoded_tensor,
+    max_new_tokens=6,
+    context_size=GPT_CONFIG_124M["context_length"],
+)
+
+print("Output", out)
+print("Output length:", len(out[0]))
+```
+
+```text
+Output tensor([[15496,    11,   314,   716, 27018, 24086,
+                47843, 30961, 42348,  7267]])
+Output length: 10
+```
+
+`model.eval()` disables dropout. The original four tokens plus six generated tokens give a final length of ten.
+
+```python
+decoded_output = tokenizer.decode(out[0].tolist())
+print("Decoded output:", decoded_output)
+```
+
+```text
+Decoded output: Hello, I am Featureiman Byeswickattribute argue
+```
+
+Meaningless output is expected: the model has only been constructed and randomly initialized, not trained. The experiment demonstrates that data can flow through the model and that token-by-token generation works mechanically.
+
+## 11. Final understanding
+
+This chapter completes the assembly from individual components to a GPT architecture:
+
+| Component            | Purpose                                         | Changes external shape? |
+| -------------------- | ----------------------------------------------- | ----------------------- |
+| LayerNorm            | Stabilizes each token’s feature distribution    | No                      |
+| Multi-head attention | Exchanges information among previous tokens     | No                      |
+| Feed-forward network | Transforms each token’s features independently  | No                      |
+| Residual connection  | Provides a direct information and gradient path | No                      |
+| Transformer block    | Combines attention and feed-forward processing  | No                      |
+| Output head          | Maps 768 dimensions to the entire vocabulary    | Yes                     |
+
+The architecture can now produce logits and token IDs, but random weights contain no language knowledge. The next step is to define a loss and train these parameters on text.
+
+## References
+
+- [Sebastian Raschka, _Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch)
+- [Official LLMs-from-scratch GitHub repository](https://github.com/rasbt/LLMs-from-scratch)
+- [Official Chapter 4 notebook](https://github.com/rasbt/LLMs-from-scratch/blob/main/ch04/01_main-chapter-code/ch04.ipynb)

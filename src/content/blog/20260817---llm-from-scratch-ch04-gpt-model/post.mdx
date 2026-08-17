@@ -1,0 +1,571 @@
+---
+title: '组装一个 GPT 模型：LLM from Scratch 第 4 章笔记'
+description: '从 LayerNorm、GELU、残差连接和 Transformer block，逐步组装 GPT-2 small 架构。'
+publishDate: 2026-08-17
+tags:
+  - llm
+  - pytorch
+  - transformer
+  - book-notes
+language: 'zh-CN'
+draft: true
+comment: false
+---
+
+> **来源说明**
+>
+> 本文是我跟随 Sebastian Raschka 的 [_Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch) 第 4 章 “Implementing a GPT Model from Scratch to Generate Text” 所做的学习笔记。代码来自该书及其[官方 Chapter 4 配套代码](https://github.com/rasbt/LLMs-from-scratch/tree/main/ch04/01_main-chapter-code)，版权归原作者所有，并按官方仓库的 Apache 2.0 许可证发布。本文不会代替原书，而是记录我如何理解每个组件以及张量如何流过完整模型。
+
+第 3 章实现了多头因果注意力。第 4 章要把它与其他组件组装成一个 GPT 模型：
+
+```text
+token IDs
+  → token embedding + position embedding
+  → 12 个 Transformer blocks
+       ├── LayerNorm → causal attention → residual connection
+       └── LayerNorm → feed-forward network → residual connection
+  → final LayerNorm
+  → vocabulary logits
+```
+
+这里搭建的是 GPT-2 small 风格的架构，但权重仍是随机初始化的，还没有经过训练。
+
+## 1. 模型配置
+
+```python
+GPT_CONFIG_124M = {
+    "vocab_size": 50257,       # Vocabulary size
+    "context_length": 1024,    # Context length
+    "emb_dim": 768,            # Embedding dimension
+    "n_heads": 12,             # Number of attention heads
+    "n_layers": 12,            # Number of layers
+    "drop_rate": 0.1,          # Dropout rate
+    "qkv_bias": False,         # Query-Key-Value bias
+}
+```
+
+| 配置             | 含义                                              |
+| ---------------- | ------------------------------------------------- |
+| `vocab_size`     | GPT-2 分词器有 50,257 个 token                    |
+| `context_length` | 模型一次最多处理 1,024 个位置                     |
+| `emb_dim`        | 每个 token 在模型内部表示为 768 维向量            |
+| `n_heads`        | 每个 attention 层使用 12 个 head，每个 head 64 维 |
+| `n_layers`       | 连续堆叠 12 个 Transformer blocks                 |
+| `drop_rate`      | 训练时以 10% 概率执行 dropout                     |
+| `qkv_bias`       | Q、K、V 线性投影不使用 bias                       |
+
+这个字典让所有组件共享同一组尺寸，避免在多个类中重复写数字。
+
+## 2. LayerNorm
+
+```python
+import torch
+import torch.nn as nn
+
+class LayerNorm(nn.Module):
+    def __init__(self, emb_dim):
+        super().__init__()
+        self.eps = 1e-5
+        self.scale = nn.Parameter(torch.ones(emb_dim))
+        self.shift = nn.Parameter(torch.zeros(emb_dim))
+
+    def forward(self, x):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        norm_x = (x - mean) / torch.sqrt(var + self.eps)
+        return self.scale * norm_x + self.shift
+```
+
+逐步来看：
+
+- `dim=-1` 表示只沿 embedding 维度计算均值和方差。不同 token、不同批次不会混在一起。
+- `keepdim=True` 保留长度为 1 的最后一维，使结果可以自动广播回原张量。
+- `unbiased=False` 使用总体方差，与 LayerNorm 的计算方式一致。
+- `x - mean` 把每个 token 的特征移到均值 0 附近。
+- 除以标准差使方差接近 1。
+- `eps` 防止方差为 0 时除以 0。
+- `scale` 和 `shift` 是可训练参数。它们让网络在需要时重新缩放和移动归一化后的值。
+
+LayerNorm 改变的是数值分布，不改变输入形状。
+
+## 3. GELU 激活函数
+
+```python
+class GELU(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return 0.5 * x * (
+            1 + torch.tanh(
+                torch.sqrt(torch.tensor(2.0 / torch.pi))
+                * (x + 0.044715 * torch.pow(x, 3))
+            )
+        )
+```
+
+GELU 是一个平滑激活函数。与 ReLU 把所有负数直接变成 0 不同，GELU 会根据输入大小平滑地保留一部分负值。代码使用 tanh 近似公式：
+
+- `torch.pow(x, 3)` 计算立方项；
+- `0.044715` 是这个近似中的常数；
+- `torch.tanh` 产生平滑的 S 形变化；
+- 最外层的 `0.5 * x` 让输出随输入连续变化。
+
+notebook 还绘制了 GELU 与 ReLU：
+
+```python
+import matplotlib.pyplot as plt
+
+gelu, relu = GELU(), nn.ReLU()
+x = torch.linspace(-3, 3, 100)
+y_gelu, y_relu = gelu(x), relu(x)
+
+plt.figure(figsize=(8, 3))
+for i, (y, label) in enumerate(
+    zip([y_gelu, y_relu], ["GELU", "ReLU"]), 1
+):
+    plt.subplot(1, 2, i)
+    plt.plot(x, y)
+    plt.title(label)
+    plt.grid(True)
+plt.tight_layout()
+plt.show()
+```
+
+图形的关键区别是：ReLU 在 0 处有折角，并完全删除负输入；GELU 的曲线是平滑的，在接近 0 的负数区域仍保留少量信息。
+
+## 4. Feed-forward network
+
+```python
+class FeedForward(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(cfg["emb_dim"], 4 * cfg["emb_dim"]),
+            GELU(),
+            nn.Linear(4 * cfg["emb_dim"], cfg["emb_dim"]),
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+```
+
+这个网络独立地处理每个 token：
+
+1. 第一层把最后一维从 768 扩大到 3,072。
+2. GELU 引入非线性，否则两个线性层合起来仍只相当于一个线性变换。
+3. 第二层把维度从 3,072 压回 768。
+
+因此输入和输出都可以是 `[batch, tokens, 768]`。`nn.Linear` 只处理最后一维，前面的批次和 token 维度会被保留。
+
+## 5. 残差连接为什么重要
+
+残差连接把普通的 `y = F(x)` 改成：
+
+```text
+y = x + F(x)
+```
+
+即使 `F` 中的梯度很小，`x` 仍提供一条直接路径，让梯度更容易传到前面的层。
+
+notebook 用一个小型深度网络比较有无 shortcut：
+
+```python
+class ExampleDNN(nn.Module):
+    def __init__(self, layer_sizes, use_shortcut):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(layer_sizes[0], layer_sizes[1]),
+                    GELU(),
+                ),
+                nn.Sequential(
+                    nn.Linear(layer_sizes[1], layer_sizes[2]),
+                    GELU(),
+                ),
+                nn.Sequential(
+                    nn.Linear(layer_sizes[2], layer_sizes[3]),
+                    GELU(),
+                ),
+                nn.Sequential(
+                    nn.Linear(layer_sizes[3], layer_sizes[4]),
+                    GELU(),
+                ),
+                nn.Sequential(
+                    nn.Linear(layer_sizes[4], layer_sizes[5]),
+                    GELU(),
+                ),
+            ]
+        )
+        self.use_shortcut = use_shortcut
+
+    def forward(self, x):
+        for layer in self.layers:
+            layer_output = layer(x)
+            if self.use_shortcut and x.shape == layer_output.shape:
+                x = x + layer_output
+            else:
+                x = layer_output
+        return x
+```
+
+`x.shape == layer_output.shape` 很重要：只有尺寸一致时，两个张量才能逐元素相加。最后一层从 3 维变成 1 维，因此不能加 shortcut。
+
+下面的辅助函数执行前向计算、均方误差和反向传播，再打印每层权重梯度的平均绝对值：
+
+```python
+def print_gradients(model, x):
+    output = model(x)
+    target = torch.tensor([0.])
+
+    loss = nn.MSELoss()
+    loss = loss(output, target)
+    loss.backward()
+
+    for name, param in model.named_parameters():
+        if "weight" in name:
+            print(
+                f"{name}: {param.grad.abs().mean().item()}"
+            )
+```
+
+没有 shortcut：
+
+```text
+layers.0.0.weight: 0.0006052075768820941
+layers.1.0.weight: 0.00036033481592312455
+layers.2.0.weight: 0.0021456123795360327
+layers.3.0.weight: 0.004196621477603912
+layers.4.0.weight: 0.015148940496146679
+```
+
+使用 shortcut：
+
+```text
+layers.0.0.weight: 0.22169791162014008
+layers.1.0.weight: 0.20694105327129364
+layers.2.0.weight: 0.32896989583969116
+layers.3.0.weight: 0.2665732204914093
+layers.4.0.weight: 1.3258541822433472
+```
+
+在这个演示中，前面层的梯度明显更大，说明直接路径缓解了梯度逐层缩小的问题。这是一个示例，不表示 residual connection 能绝对避免所有梯度消失或爆炸。
+
+## 6. Transformer block
+
+第 3 章的多头注意力保存在 `attention.py` 中：
+
+```python
+from attention import MultiHeadAttention
+```
+
+完整 block 有两个主要子层：attention 和 feed-forward。每个子层前先做 LayerNorm，之后使用 dropout 和残差连接。
+
+```python
+class TransformerBlock(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.att = MultiHeadAttention(
+            d_in=cfg["emb_dim"],
+            d_out=cfg["emb_dim"],
+            context_length=cfg["context_length"],
+            num_heads=cfg["n_heads"],
+            dropout=cfg["drop_rate"],
+            qkv_bias=cfg["qkv_bias"],
+        )
+        self.ff = FeedForward(cfg)
+        self.norm1 = LayerNorm(cfg["emb_dim"])
+        self.norm2 = LayerNorm(cfg["emb_dim"])
+        self.dropout_shortcut = nn.Dropout(cfg["drop_rate"])
+
+    def forward(self, x):
+        shortcut = x
+        x = self.norm1(x)
+        x = self.att(x)
+        x = self.dropout_shortcut(x)
+        x = x + shortcut
+
+        shortcut = x
+        x = self.norm2(x)
+        x = self.ff(x)
+        x = self.dropout_shortcut(x)
+        x = x + shortcut
+        return x
+```
+
+第一半让 token 通过因果 attention 从以前的位置收集信息；第二半让每个 token 的 768 个特征通过 feed-forward network 进一步变换。两条 shortcut 都要求子层保持相同形状。
+
+```python
+block = TransformerBlock(GPT_CONFIG_124M)
+
+torch.manual_seed(123)
+x = torch.rand(2, 4, 768)
+output = block(x)
+print(x.shape)
+print(output.shape)
+```
+
+```text
+torch.Size([2, 4, 768])
+torch.Size([2, 4, 768])
+```
+
+一个 block 改变内容，但不改变 `[batch, tokens, embedding]` 的外部形状，所以可以连续堆叠 12 次。
+
+## 7. 完整 GPT 模型
+
+```python
+class GPTModel(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.tok_emb = nn.Embedding(
+            cfg["vocab_size"], cfg["emb_dim"]
+        )
+        self.pos_emb = nn.Embedding(
+            cfg["context_length"], cfg["emb_dim"]
+        )
+        self.drop_emb = nn.Dropout(cfg["drop_rate"])
+
+        self.trf_blocks = nn.Sequential(
+            *[
+                TransformerBlock(cfg)
+                for _ in range(cfg["n_layers"])
+            ]
+        )
+        self.final_norm = LayerNorm(cfg["emb_dim"])
+        self.out_head = nn.Linear(
+            cfg["emb_dim"], cfg["vocab_size"], bias=False
+        )
+
+    def forward(self, in_idx):
+        batch_size, seq_len = in_idx.shape
+        tok_embeds = self.tok_emb(in_idx)
+        pos_embeds = self.pos_emb(
+            torch.arange(seq_len, device=in_idx.device)
+        )
+
+        x = tok_embeds + pos_embeds
+        x = self.drop_emb(x)
+        x = self.trf_blocks(x)
+        x = self.final_norm(x)
+        logits = self.out_head(x)
+        return logits
+```
+
+### 初始化阶段
+
+- `tok_emb` 把每个 token ID 映射为 768 维向量。
+- `pos_emb` 为 0 到 1,023 的位置各保存一个向量。
+- 列表推导式创建 12 个独立的 `TransformerBlock`。
+- 开头的 `*` 把列表展开为 `nn.Sequential` 的位置参数。
+- `final_norm` 在输出头之前再归一化一次。
+- `out_head` 把每个 768 维向量投影到 50,257 个词表位置。
+
+### Forward 阶段
+
+输入 `in_idx` 的形状是 `[B, T]`。token 和位置 embeddings 相加后是 `[B, T, 768]`。经过 blocks 后形状不变，输出头最终产生 `[B, T, 50257]`。
+
+`device=in_idx.device` 确保位置索引与输入位于同一个 CPU 或 GPU，避免设备不匹配错误。
+
+## 8. 用两个短句测试模型
+
+```python
+import tiktoken
+
+tokenizer = tiktoken.get_encoding("gpt2")
+batch = []
+txt1 = "Every effort moves you"
+txt2 = "Every day holds a"
+batch.append(torch.tensor(tokenizer.encode(txt1)))
+batch.append(torch.tensor(tokenizer.encode(txt2)))
+batch = torch.stack(batch, dim=0)
+print(batch)
+```
+
+```text
+tensor([[6109, 3626, 6100,  345],
+        [6109, 1110, 6622,  257]])
+```
+
+两个句子碰巧都编码为 4 个 token，所以可以直接堆叠成 `[2, 4]`。如果长度不同，实际训练还需要 padding 或 batching 策略。
+
+```python
+torch.manual_seed(123)
+model = GPTModel(GPT_CONFIG_124M)
+out = model(batch)
+print("Output shape:", out.shape)
+print(out)
+```
+
+```text
+Output shape: torch.Size([2, 4, 50257])
+tensor([[[ 4.1593e-01,  2.8493e-01, -8.1283e-02,  ...,  1.3853e-01,
+          -9.3770e-04, -5.9128e-01],
+         ...,
+         [-1.2726e+00,  1.9112e-01, -4.3017e-01,  ...,  9.5809e-01,
+           1.9775e-01, -7.2380e-01]],
+
+        [[ 3.6637e-01,  8.8838e-02, -3.8053e-01,  ..., -6.8561e-02,
+           1.2058e-01, -3.2590e-01],
+         ...,
+         [ 1.3891e-01,  2.8607e-01,  5.0605e-01,  ...,  5.9626e-01,
+          -4.4778e-01, -2.3845e-01]]],
+       grad_fn=<UnsafeViewBackward0>)
+```
+
+这里有一个重要区别：这些 50,257 个数是 **logits**，不是概率。logit 可以是任意实数，也不会加总为 1。只有对最后一维应用 softmax 后，才会得到词表上的概率分布。
+
+## 9. 参数数量与 weight tying
+
+```python
+total_params = sum(p.numel() for p in model.parameters())
+print(
+    f"Total number of parameters in the model: {total_params}"
+)
+```
+
+```text
+Total number of parameters in the model: 163009536
+```
+
+为什么配置名称是 124M，实际却是约 163M？因为当前代码创建了两个独立的大矩阵：
+
+- token embedding：`50257 × 768`；
+- output head：`768 × 50257`。
+
+原始 GPT-2 会使用 **weight tying**，让输出头复用 token embedding 的权重。notebook 用减去输出头参数的方式显示其余模型大小：
+
+```python
+total_params_gpt2 = (
+    total_params
+    - sum(p.numel() for p in model.out_head.parameters())
+)
+print(
+    "Total number of parameters in the GPT-2 model:",
+    total_params_gpt2
+)
+```
+
+```text
+Total number of parameters in the GPT-2 model: 124412160
+```
+
+严格来说，当前 `GPTModel` **尚未实际绑定这两个权重**，所以这个对象确实含有约 163M 个独立参数；124M 是去掉重复输出矩阵后的 GPT-2 风格参数量。
+
+若全部参数使用 32 位浮点数，每个参数 4 字节：
+
+```python
+total_size_bytes = total_params * 4
+total_size_mb = total_size_bytes / (1024 * 1024)
+print("Total size of the model in MB:", total_size_mb)
+```
+
+```text
+Total size of the model in MB: 621.83203125
+```
+
+这只计算参数本身。训练时还需要梯度、优化器状态和中间激活，因此实际内存需求会更大。
+
+## 10. 自回归生成文本
+
+```python
+def generate_text_simple(
+    model, idx, max_new_tokens, context_size
+):
+    for _ in range(max_new_tokens):
+        idx_cond = idx[:, -context_size:]
+
+        with torch.no_grad():
+            logits = model(idx_cond)
+
+        logits = logits[:, -1, :]
+        probs = torch.softmax(logits, dim=-1)
+        idx_next = torch.argmax(
+            probs, dim=-1, keepdim=True
+        )
+        idx = torch.cat((idx, idx_next), dim=1)
+
+    return idx
+```
+
+每次循环只生成一个 token：
+
+1. `idx[:, -context_size:]` 只保留模型能接收的最后若干 token。
+2. `torch.no_grad()` 关闭梯度记录，减少推理时的内存消耗。
+3. 模型返回所有位置的 logits。
+4. `logits[:, -1, :]` 只取最后位置，因为它负责预测下一个 token。
+5. softmax 转为概率。
+6. `argmax` 选择概率最高的 token，这是 greedy decoding。
+7. `torch.cat` 把新 token 接到序列末尾，下一轮再使用增长后的序列。
+
+对于 `argmax` 而言，softmax 不改变最大值的位置，因此可以直接对 logits 使用 `argmax`；这里保留 softmax 是为了明确概率的概念。
+
+```python
+start_context = "Hello, I am"
+encoded = tokenizer.encode(start_context)
+print("encoded:", encoded)
+
+encoded_tensor = torch.tensor(encoded).unsqueeze(0)
+print("encoded_tensor.shape:", encoded_tensor.shape)
+```
+
+```text
+encoded: [15496, 11, 314, 716]
+encoded_tensor.shape: torch.Size([1, 4])
+```
+
+`unsqueeze(0)` 在最前面添加 batch 维度，把 `[4]` 变成 `[1, 4]`。
+
+```python
+model.eval()
+out = generate_text_simple(
+    model=model,
+    idx=encoded_tensor,
+    max_new_tokens=6,
+    context_size=GPT_CONFIG_124M["context_length"],
+)
+
+print("Output", out)
+print("Output length:", len(out[0]))
+```
+
+```text
+Output tensor([[15496,    11,   314,   716, 27018, 24086,
+                47843, 30961, 42348,  7267]])
+Output length: 10
+```
+
+`model.eval()` 关闭 dropout。原来有 4 个 token，再生成 6 个，所以最终长度是 10。
+
+```python
+decoded_output = tokenizer.decode(out[0].tolist())
+print("Decoded output:", decoded_output)
+```
+
+```text
+Decoded output: Hello, I am Featureiman Byeswickattribute argue
+```
+
+输出没有意义是预期现象：我们只搭建并随机初始化了模型，还没有训练。这个实验只证明数据可以完整地流过模型并进行逐 token 生成。
+
+## 11. 最终理解
+
+这一章完成了从组件到 GPT 架构的组装：
+
+| 组件                 | 作用                           | 是否改变外部形状 |
+| -------------------- | ------------------------------ | ---------------- |
+| LayerNorm            | 稳定每个 token 的特征分布      | 否               |
+| Multi-head attention | 在过去的 token 之间交换信息    | 否               |
+| Feed-forward network | 独立变换每个 token 的特征      | 否               |
+| Residual connection  | 提供信息和梯度的直接路径       | 否               |
+| Transformer block    | 组合 attention 与 feed-forward | 否               |
+| Output head          | 从 768 维映射到整个词表        | 是               |
+
+模型结构已经能够产生 logits 和 token，但随机权重还不包含语言知识。下一步需要定义损失函数，用大量文本训练这些参数。
+
+## 参考资料
+
+- [Sebastian Raschka, _Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch)
+- [官方 LLMs-from-scratch GitHub 仓库](https://github.com/rasbt/LLMs-from-scratch)
+- [官方 Chapter 4 notebook](https://github.com/rasbt/LLMs-from-scratch/blob/main/ch04/01_main-chapter-code/ch04.ipynb)
