@@ -1,23 +1,24 @@
 ---
 title: '从文本到输入向量：LLM from Scratch 第 2 章学习笔记'
 description: '逐行理解 GPT-2 分词、滑动窗口、PyTorch DataLoader、词元嵌入与位置嵌入。'
-publishDate: 2026-08-17
+publishDate: 2026-08-18
 tags:
   - llm
   - pytorch
   - tokenization
   - book-notes
 language: 'zh-CN'
-draft: true
+draft: false
 comment: false
 ---
 
 > **来源说明**
 >
-> 本文是我跟随 Sebastian Raschka 的 [_Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch) 第 2 章 “Working with Text Data” 所做的学习笔记。更完整的代码都可以在原作者的github(https://github.com/rasbt/LLMs-from-scratch/tree/main/ch02/01_main-chapter-code)中找到，
-> 代码版权归原作者所有，并按官方仓库的 Apache 2.0 许可证发布。这里不会代替原书内容，而是记录我对每行代码作用的学习。初稿由Codex参考我学习时写的jupyter notebook生成，之后由我逐步完善和修改。
+> 本文是我跟随 Sebastian Raschka 的 [_Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch) 第 2 章 “Working with Text Data” 所做的学习笔记。更完整的代码可以在原作者的 [GitHub 仓库](https://github.com/rasbt/LLMs-from-scratch/tree/main/ch02/01_main-chapter-code)中找到。
+> 代码版权归原作者所有，并按官方仓库的 Apache 2.0 许可证发布。这里不会代替原书内容，而是记录我对每行代码作用的学习。初稿由 Codex 参考我学习时写的 Jupyter notebook 生成，之后由我逐步完善和修改。
 
-这份 notebook 从第 2 章的后半部分开始，重点是把一段文本变成语言模型可以接收的输入。完整流程可以压缩成一条链：
+这本书以构建一个 GPT-2 风格的 LLM 为主线，逐步介绍组成和训练 LLM 的主要部分。
+这份学习笔记主要对应第 2 章的后半部分，重点是把一段文本变成语言模型可以接收的输入。完整流程可以压缩成一条链：
 
 ```text
 原始文本
@@ -29,7 +30,7 @@ comment: false
   → LLM 的输入向量
 ```
 
-本文只准备数据，还没有训练语言模型。
+本文只准备数据，还没有训练语言模型。我的现阶段目标是对这个流程形成初步印象，并在过程中积累一些代码知识。不同的 tokenizer 和更复杂的 encoding 方法，我会留到以后再深入研究。
 
 ## 1. 下载示例文本
 
@@ -51,13 +52,8 @@ if not os.path.exists("the-verdict.txt"):
 
 - `import os` 导入 Python 的操作系统工具。这里用它检查文件是否已经存在。
 - `import urllib.request` 导入网络请求工具，用于从网址下载文件。
-- `os.path.exists("the-verdict.txt")` 返回一个布尔值：文件存在时是 `True`，不存在时是 `False`。
-- `not` 把结果反转。因此，只有文件不存在时，`if` 里面的下载代码才会运行。
-- 圆括号中的三个字符串会被 Python 自动拼接成一个完整 URL。拆成多行只是为了便于阅读。
-- `file_path` 是下载后保存到本地的文件名。
-- `urlretrieve(url, file_path)` 从 `url` 下载内容，并写入 `file_path`。
-
-原 notebook 的这个单元格有缩进丢失。上面按照作者官方 Chapter 2 notebook 恢复了缩进；这不是改变算法，而是确保 `url`、`file_path` 和下载动作都只在文件不存在时执行。如果下载语句放在 `if` 外面，那么文件已经存在时，变量 `url` 可能没有被创建，代码会报 `NameError`。
+- `os.path.exists("the-verdict.txt")`：文件存在时是 `True`，不存在时是 `False`。
+- 这个 `if` 代码块的作用是：当名为 `the-verdict.txt` 的文件不存在时，`urlretrieve(url, file_path)` 从 `url` 下载内容，并写入 `file_path`。
 
 ## 2. 创建 GPT-2 分词器
 
@@ -65,27 +61,14 @@ if not os.path.exists("the-verdict.txt"):
 import tiktoken
 ```
 
-`tiktoken` 是 OpenAI 开源的快速分词库。语言模型不能直接对字符串做矩阵运算，因此第一步是把文本拆成 token，再把每个 token 映射为整数 ID。
+`tiktoken` 是 OpenAI 开源的快速分词库。
 
 ```python
-tiktoken.__version__
-```
-
-输出：
-
-```text
-'0.13.0'
-```
-
-`__version__` 保存当前安装的版本号。在 Jupyter notebook 中，把一个值放在单元格最后一行，会自动显示它；如果在普通 `.py` 文件中运行，则通常要写成 `print(tiktoken.__version__)`。
-
-```python
+print(tiktoken.__version__)
 tokenizer = tiktoken.get_encoding("gpt2")
 ```
 
-- `get_encoding("gpt2")` 加载 GPT-2 使用的 Byte Pair Encoding（BPE）分词规则与词表。
-- `tokenizer` 不是模型。它不预测文本，只负责在文本和 token IDs 之间转换。
-- token ID 只是词表中的索引。例如，较大的 ID 不表示这个 token “更重要”。
+- `get_encoding("gpt2")` 加载 GPT-2 使用的编码规则与词表。书中提到了 Byte Pair Encoding（BPE）；我计划以后单独写一篇 blog 进一步学习。
 
 ## 3. 把文本编码成 token IDs
 
@@ -103,51 +86,16 @@ print(len(encoded_text))
 5145
 ```
 
-这里发生了三次形式转换：
-
 1. `open(..., "r", encoding="utf-8")` 以只读模式打开 UTF-8 文本。
-2. `f.read()` 读取整个文件，得到一个 Python 字符串，并保存为 `raw_text`。
+2. `f.read()` 读取整个文件，得到一个字符串，记为 `raw_text`。
 3. `tokenizer.encode(raw_text)` 把字符串转换成一个整数列表，并保存为 `encoded_text`。
 
-`with` 会在代码块结束时自动关闭文件，即使读取时发生异常，也不需要手动调用 `f.close()`。最后的 `len(encoded_text)` 统计的是 **token 数量**，不是字符数，也不是单词数。BPE token 可能是完整单词、单词的一部分、标点，甚至包含前导空格。
-
-## 4. 理解“下一个 token”训练目标
+## 4. 理解 next-token prediction
 
 ```python
 enc_sample = encoded_text[50:]
 context_size = 4
-x = enc_sample[:context_size]
-y = enc_sample[1:context_size + 1]
 
-print(f"x: {x}")
-print(f"y:      {y}")
-```
-
-输出：
-
-```text
-x: [290, 4920, 2241, 287]
-y:      [4920, 2241, 287, 257]
-```
-
-- `encoded_text[50:]` 跳过前 50 个 token，只是为了选取一个便于演示的片段。
-- `context_size = 4` 表示一次给模型看 4 个 token。
-- `x` 取得位置 `0` 到 `3` 的 4 个 token。
-- `y` 从位置 `1` 开始，也取得 4 个 token。
-
-如果片段写成抽象符号，关系会非常清楚：
-
-| 位置  | 0     | 1     | 2     | 3     | 4     |
-| ----- | ----- | ----- | ----- | ----- | ----- |
-| token | $t_0$ | $t_1$ | $t_2$ | $t_3$ | $t_4$ |
-| `x`   | $t_0$ | $t_1$ | $t_2$ | $t_3$ |       |
-| `y`   |       | $t_1$ | $t_2$ | $t_3$ | $t_4$ |
-
-因此，`y` 就是 `x` 向右移动一个位置后的结果。模型将学习：看到 `x` 的每个位置及其左侧上下文时，对应的下一个 token 应该是 `y` 中同一列的值。
-
-### 把 ID 解码成人能读懂的文本
-
-```python
 for i in range(1, context_size + 1):
     context = enc_sample[:i]
     desired = enc_sample[i]
@@ -163,15 +111,9 @@ for i in range(1, context_size + 1):
  and established himself in ->  a
 ```
 
-- `range(1, context_size + 1)` 生成 `1, 2, 3, 4`。结尾值不包含在 `range` 中，所以需要写 `+ 1`。
-- `enc_sample[:i]` 让上下文从 1 个 token 逐步增长到 4 个 token。
-- `enc_sample[i]` 选择紧跟在当前上下文之后的那个 token。
-- `decode(context)` 把多个 token IDs 转回字符串。
-- `decode([desired])` 接收一个 ID 列表，因此单个整数 `desired` 也要放进方括号。
+这里可以非常直观地看到 next-token prediction 想达到的效果：给定 context（前面一串 token），希望模型预测下一个 token。
 
-输出表达的是：给定左边不断增长的上下文，模型希望预测箭头右边的 token。
-
-### 直接查看同一关系的数字形式
+### 直接查看同一关系的 encoded 形式
 
 ```python
 for i in range(1, context_size + 1):
@@ -189,17 +131,10 @@ for i in range(1, context_size + 1):
  [290, 4920, 2241, 287] -> 257
 ```
 
-这段循环没有改变数据，只是不再解码。它帮助我们把“可读文本”和“模型实际接收的整数”联系起来。
-
 ## 5. 用 PyTorch Dataset 创建滑动窗口
 
 ```python
 import torch
-```
-
-PyTorch 负责张量、数据批次和后续的神经网络计算。
-
-```python
 torch.__version__
 ```
 
@@ -209,7 +144,7 @@ torch.__version__
 '2.13.0+cpu'
 ```
 
-和 `tiktoken.__version__` 一样，这用于记录实验环境。版本信息在排查不同电脑上的行为差异时很有用。
+记录版本信息在排查不同电脑上的行为差异时很有用。
 
 ```python
 from torch.utils.data import Dataset, DataLoader
@@ -235,12 +170,8 @@ class GPTDatasetV1(Dataset):
         return self.input_ids[idx], self.target_ids[idx]
 ```
 
-### 类和初始化方法
-
-- `class GPTDatasetV1(Dataset)` 创建一个继承自 PyTorch `Dataset` 的自定义数据集。继承后，PyTorch 的 `DataLoader` 就知道如何向它索取样本。
-- `__init__` 在创建数据集对象时运行。
-- `text` 是完整字符串；`tokenizer` 负责编码；`max_length` 是每个样本的 token 数；`stride` 是窗口每次前进的距离。
-- `self.input_ids` 与 `self.target_ids` 是两个列表，用来保存所有输入序列和目标序列。
+- `GPTDatasetV1(Dataset)` 是一个继承自 PyTorch `Dataset` 的类。继承后，PyTorch 的 `DataLoader` 就知道如何向它索取样本。
+  这里可以看出，类经常用于打包需要保存状态并反复使用的相关功能。
 
 ### 一次编码完整文本
 
@@ -248,43 +179,51 @@ class GPTDatasetV1(Dataset):
 token_ids = tokenizer.encode(text, allowed_special={"<|endoftext|>"})
 ```
 
-完整文本只编码一次。`allowed_special` 表示如果文本中真的出现 `<|endoftext|>`，允许分词器把它当作 GPT-2 的特殊 token，而不是抛出错误。它不会自动把这个 token 添加到文本里。
+`allowed_special` 表示如果文本中真的出现 `<|endoftext|>`，允许分词器把它当作 GPT-2 的特殊 token，而不是抛出错误。它不会自动把这个 token 添加到文本里。
 
 ### 移动窗口
 
 ```python
 for i in range(0, len(token_ids) - max_length, stride):
+    input_seq = token_ids[i:i + max_length]
+    target_seq = token_ids[i + 1:i + max_length + 1]
 ```
 
 - 起点是 `0`。
 - 终点保证输入窗口之后至少还有一个 token，因为目标需要向右移动一位。
 - 每次增加 `stride`，控制相邻样本重叠多少。
 
-例如，`max_length=4`、`stride=2` 时，窗口起点是 `0, 2, 4, ...`，相邻输入会重叠两个 token。`stride=4` 时，输入窗口之间不重叠。
+例如，`max_length=4`、`stride=2` 时，窗口起点是 `0, 2, 4, ...`，相邻输入会重叠两个 token。`stride=4` 时，输入窗口之间就没有重叠。
 
-```python
-input_seq = token_ids[i:i + max_length]
-target_seq = token_ids[i + 1:i + max_length + 1]
+假设 `token_ids` 中有一段是 `[2, 5, 420, 8, 9, 13, 20, 67, 99]`。第一个样本始终是：
+
+```text
+input_seq:  [2, 5, 420, 8]
+target_seq: [5, 420, 8, 9]
 ```
 
-这两行把前面的小例子推广到整篇文本：输入从 `i` 开始，目标从 `i + 1` 开始，但二者长度相同。
+`stride` 决定的是下一个窗口从哪里开始，而不是当前 `target_seq` 如何移动。`stride=2` 时，下一个样本是：
+
+```text
+input_seq:  [420, 8, 9, 13]
+target_seq: [8, 9, 13, 20]
+```
+
+`stride=4` 时，下一个样本则是：
+
+```text
+input_seq:  [9, 13, 20, 67]
+target_seq: [13, 20, 67, 99]
+```
 
 ```python
 self.input_ids.append(torch.tensor(input_seq, dtype=torch.long))
 self.target_ids.append(torch.tensor(target_seq, dtype=torch.long))
 ```
 
-- `torch.tensor(...)` 把 Python 整数列表转换为 PyTorch 张量。
-- `dtype=torch.long` 使用 64 位整数。PyTorch 的 embedding 层需要整数索引，不能使用普通浮点数作为 token ID。
-- `append` 把当前窗口保存进数据集。
+- PyTorch 的 embedding 层需要整数类型的 token ID 张量（例如 `torch.long`），不能把浮点数作为索引。
 
-### 让 DataLoader 能读取数据集
-
-- `__len__` 返回样本总数，所以 `len(dataset)` 可以工作。
-- `__getitem__(idx)` 返回第 `idx` 个 `(input, target)` 对，所以 `dataset[0]` 可以工作。
-- Python 中以双下划线包围的方法叫特殊方法。`DataLoader` 会在后台调用它们。
-
-## 6. 把样本组成批次
+## 6. 用 DataLoader 生成批次
 
 ```python
 def create_dataloader_v1(text, batch_size=2, max_length=256,
@@ -302,24 +241,21 @@ def create_dataloader_v1(text, batch_size=2, max_length=256,
 
 这个函数把创建分词器、数据集和 DataLoader 的步骤包装在一起：
 
-- `batch_size`：一次返回多少个样本。
+- `batch_size`：每个批次包含多少个样本。
 - `max_length`：每个样本包含多少个 token，也叫上下文长度。
 - `stride`：滑动窗口每次前进多少个 token。
-- `shuffle`：每轮是否打乱样本顺序。训练时通常开启；观察固定示例时关闭。
-- `drop_last`：最后一个批次不足 `batch_size` 时是否丢弃。固定形状的训练批次通常更方便。
-- `num_workers=0`：由当前 Python 进程加载数据。这个设置最简单，也更适合 notebook 和 Windows 环境。
-- `return dataloader`：把创建好的加载器交给调用者。
+- `shuffle`：每轮是否打乱样本顺序。训练时通常开启；验证或测试时关闭。
+- `drop_last`：最后一个批次不足 `batch_size` 时是否丢弃。
+- `num_workers`：使用多少个额外的子进程并行准备批次。设为 `0` 时，由当前 Python 进程加载数据。
 
-## 7. 取出一个批次
+## 7. 观察一个 batch
+
+实验一下刚刚写的 DataLoader，一是为了确认它是否正确运行，二是对 batch 的样子形成直观印象。
 
 ```python
 with open("the-verdict.txt", "r", encoding="utf-8") as f:
     raw_text = f.read()
-```
 
-这里重新读取文本，是为了让这个实验部分可以独立运行。
-
-```python
 dataloader = create_dataloader_v1(
     raw_text,
     batch_size=8,
@@ -358,29 +294,9 @@ Target:
         [ 3285,   326,    11,   287]])
 ```
 
-- `batch_size=8` 让一个批次含有 8 个序列。
-- `max_length=4` 让每个序列含有 4 个 token。
-- `stride=4` 让相邻输入窗口不重叠。
-- `shuffle=False` 保留原文顺序，便于检查。
-- `iter(dataloader)` 创建一个迭代器。
-- `next(data_iter)` 取出第一个批次，并拆成输入与目标。
-
-因此，`input` 和 `target` 的形状都是 `[8, 4]`：第一维是批次大小，第二维是序列长度。这里的变量名 `input` 会遮蔽 Python 内置的 `input()` 函数；不影响本例，但在自己的项目中用 `inputs` 会更清楚。
-
-每一行目标仍然是对应输入向左错开一个 token 后的结果。例如：
-
-```text
-input:  [t0, t1, t2, t3]
-target: [t1, t2, t3, t4]
-```
+`input` 和 `target` 的形状都是 `[8, 4]`：第一维是批次大小，第二维是序列长度。这里的变量名 `input` 会遮蔽 Python 内置的 `input()` 函数；本例不受影响，但在自己的项目中使用 `inputs` 会更清楚。
 
 ## 8. 把 token IDs 映射为向量
-
-```python
-dir(tokenizer)
-```
-
-`dir` 会列出对象可访问的属性和方法。这是一种探索 Python 对象的方式，但输出很长。这里真正要用的是下面的 `n_vocab`。
 
 ```python
 torch.manual_seed(123)
@@ -392,7 +308,7 @@ embedding_layer = torch.nn.Embedding(
 )
 ```
 
-- `torch.manual_seed(123)` 固定 PyTorch 随机数种子，使随机初始化在重复运行时更容易复现。
+- `torch.manual_seed(123)` 固定 PyTorch 随机数种子，使随机初始化在重复运行时更容易复现。这里需要使用它，是因为 `nn.Embedding` 会随机初始化 weight table。
 - `tokenizer.n_vocab` 是 GPT-2 词表大小，即 embedding 表需要多少行。
 - `output_dim=256` 表示每个 token 用 256 个浮点数表示。
 - `torch.nn.Embedding` 创建一个可训练的查找表，形状为 `[vocab_size, output_dim]`。
@@ -407,7 +323,7 @@ print(embedding_layer.weight.shape)
 torch.Size([50257, 256])
 ```
 
-`weight` 是 embedding 层的参数矩阵。输入一个 token ID，就相当于取出矩阵中对应的那一行。刚创建时这些值是随机的；只有经过训练后，它们才会形成对模型有用的表示。
+这意味着词表中的 50,257 个 token ID 都会各自映射到一个 256 维向量。
 
 ```python
 token_embeddings = embedding_layer(input)
@@ -420,13 +336,11 @@ token_embeddings.shape
 torch.Size([8, 4, 256])
 ```
 
-输入 token IDs 的形状是 `[8, 4]`。每个 ID 被替换为一个 256 维向量后，形状变成 `[8, 4, 256]`：
-
-| 维度    | 含义                  | 当前值 |
-| ------- | --------------------- | ------ |
-| 第 1 维 | 一个批次中的序列数    | 8      |
-| 第 2 维 | 每个序列的 token 数   | 4      |
-| 第 3 维 | 每个 token 的向量维度 | 256    |
+| 维度    | 含义                         | 当前值 |
+| ------- | ---------------------------- | ------ |
+| 第 1 维 | 一个批次中的序列数           | 8      |
+| 第 2 维 | 每个序列包含的 token 数      | 4      |
+| 第 3 维 | 每个 token 的 embedding 维度 | 256    |
 
 ## 9. 添加位置信息
 
@@ -441,11 +355,8 @@ pos_embedding_layer = torch.nn.Embedding(
 pos_embeddings = pos_embedding_layer(torch.arange(context_length))
 ```
 
-- `context_length=4` 对应当前序列长度。
-- 位置 embedding 表有 4 行，分别代表位置 `0, 1, 2, 3`。
-- 每个位置向量同样有 256 维，所以可以与 token embedding 相加。
 - `torch.arange(context_length)` 生成整数张量 `[0, 1, 2, 3]`。
-- 把这些位置索引传入 embedding 层，得到 4 个位置向量。
+- 把这些索引传入 position embedding 层，得到各自对应的向量，也就是用这些向量编码“位置”信息。
 
 ```python
 pos_embeddings.shape
@@ -486,20 +397,47 @@ PyTorch 使用 **broadcasting（广播）**，把同一组 `[4, 256]` 位置向�
 
 这个 `input_embeddings` 就是后续 Transformer 模块接收的输入。
 
-## 10. 最终理解
+## 10. 总结
 
-这一段代码最重要的不是记住 API，而是理解形状和数据的变化：
+这一段代码最重要的不是记住 API，而是理解数据如何一步步变成模型可以处理的向量：
 
-| 阶段                | 数据示例                | 形状              |
-| ------------------- | ----------------------- | ----------------- |
-| 原始文本            | Python 字符串           | 无固定张量形状    |
-| token IDs           | 每个 token 对应一个整数 | `[全部 token 数]` |
-| 一个输入批次        | 8 个长度为 4 的序列     | `[8, 4]`          |
-| token embeddings    | 每个 ID 变成 256 维向量 | `[8, 4, 256]`     |
-| position embeddings | 4 个位置各有一个向量    | `[4, 256]`        |
-| 最终输入 embeddings | token 与位置向量相加    | `[8, 4, 256]`     |
+```text
+原始文本（Python 字符串）
+│
+│  GPT-2 BPE tokenizer 拆分文本
+▼
+tokens（单词、子词或标点片段）
+│
+│  GPT-2 词表把每个 token 映射为整数
+▼
+token IDs
+│
+│  滑动窗口与 DataLoader
+▼
+输入 ID 批次 [batch_size, seq_len]
+│
+│  token embedding 查找
+▼
+token embeddings [batch_size, seq_len, embed_dim]
 
-我现在对这段流程的理解是：语言模型的训练目标来自文本本身。我们不需要人工为每个词标标签，只要把原序列复制一份并向右移动一个 token，就得到了每个位置的正确答案。Embedding 层再把离散 ID 转成可以参与神经网络计算的连续向量。
+位置 IDs [0, 1, ..., seq_len-1]
+│
+│  position embedding 查找
+▼
+position embeddings [seq_len, embed_dim]
+
+token embeddings [batch_size, seq_len, embed_dim]
++ position embeddings [seq_len, embed_dim]（沿 batch 维度广播）
+│
+│  逐元素相加
+▼
+最终输入 embeddings [batch_size, seq_len, embed_dim]
+│
+▼
+后续 Transformer 模块
+```
+
+图中把“拆分 tokens”和“映射 token IDs”分开，是为了说明概念；在代码中，我们使用的 `tiktoken` 会通过 `tokenizer.encode(raw_text)` 连续完成这两步。训练目标则来自同一组 token IDs 向右移动一个位置后的副本。
 
 下一步将是把这些输入向量送入注意力机制，学习序列中不同位置之间的关系。
 
