@@ -13,7 +13,7 @@ interface Props {
 }
 
 const {
-  data: { title, publishDate },
+  data: { title, publishDate, updatedDate },
   lang,
   class: className
 } = Astro.props
@@ -23,11 +23,13 @@ const labels =
     ? {
         author: 'Author',
         published: 'Published',
+        updated: 'Last updated',
         copyright: 'Copyright'
       }
     : {
         author: '作者',
         published: '发布日期',
+        updated: '最后更新',
         copyright: '版权'
       }
 
@@ -62,6 +64,17 @@ const copyrightText =
         {formatDate(publishDate, lang, { month: 'long' })}
       </span>
     </div>
+
+    {
+      updatedDate && (
+        <div class='flex gap-x-2 sm:flex-col'>
+          <span>{labels.updated}</span>
+          <span class='text-sm text-foreground'>
+            {formatDate(updatedDate, lang, { month: 'long' })}
+          </span>
+        </div>
+      )
+    }
 
     <div class='flex gap-x-2 sm:flex-col'>
       <span>{labels.copyright}</span>
