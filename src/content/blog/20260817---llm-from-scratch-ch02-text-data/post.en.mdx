@@ -174,7 +174,7 @@ class GPTDatasetV1(Dataset):
 - `GPTDatasetV1(Dataset)` defines a class that inherits from PyTorch’s `Dataset`. Through this inheritance, PyTorch’s `DataLoader` knows how to request samples from it.
   This illustrates how classes are often used to package related functionality that needs to preserve state and be reused.
 
-### Encoding the complete text once
+### Tokenizing and encoding the entire text
 
 ```python
 token_ids = tokenizer.encode(text, allowed_special={"<|endoftext|>"})
@@ -267,9 +267,9 @@ dataloader = create_dataloader_v1(
     num_workers=0
 )
 data_iter = iter(dataloader)
-input, target = next(data_iter)
-print(f"Input:\n", input)
-print(f"Target:\n", target)
+inputs, targets = next(data_iter)
+print(f"Input:\n", inputs)
+print(f"Target:\n", targets)
 ```
 
 Output:
@@ -295,7 +295,7 @@ Target:
         [ 3285,   326,    11,   287]])
 ```
 
-`input` and `target` both have shape `[8, 4]`: the first dimension is batch size, and the second is sequence length. The variable name `input` shadows Python’s built-in `input()` function. It does not affect this example, but using `inputs` would be clearer in my own projects.
+`inputs` and `targets` both have shape `[8, 4]`: the first dimension is batch size, and the second is sequence length.
 
 ## 8. Mapping token IDs to vectors
 

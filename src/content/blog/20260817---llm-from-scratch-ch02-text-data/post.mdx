@@ -173,7 +173,7 @@ class GPTDatasetV1(Dataset):
 - `GPTDatasetV1(Dataset)` 是一个继承自 PyTorch `Dataset` 的类。继承后，PyTorch 的 `DataLoader` 就知道如何向它索取样本。
   这里可以看出，类经常用于打包需要保存状态并反复使用的相关功能。
 
-### 一次编码完整文本
+### Tokenize和encode整个文本
 
 ```python
 token_ids = tokenizer.encode(text, allowed_special={"<|endoftext|>"})
@@ -266,9 +266,9 @@ dataloader = create_dataloader_v1(
     num_workers=0
 )
 data_iter = iter(dataloader)
-input, target = next(data_iter)
-print(f"Input:\n", input)
-print(f"Target:\n", target)
+inputs, targets = next(data_iter)
+print(f"Input:\n", inputs)
+print(f"Target:\n", targets)
 ```
 
 输出：
@@ -294,7 +294,7 @@ Target:
         [ 3285,   326,    11,   287]])
 ```
 
-`input` 和 `target` 的形状都是 `[8, 4]`：第一维是批次大小，第二维是序列长度。这里的变量名 `input` 会遮蔽 Python 内置的 `input()` 函数；本例不受影响，但在自己的项目中使用 `inputs` 会更清楚。
+`inputs` 和 `targets` 的形状都是 `[8, 4]`：第一维是批次大小，第二维是序列长度。
 
 ## 8. 把 token IDs 映射为向量
 
