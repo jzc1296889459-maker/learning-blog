@@ -4,14 +4,17 @@ import { getImage } from 'astro:assets'
 import { getCollection, type CollectionEntry } from 'astro:content'
 import rss from '@astrojs/rss'
 import type { Root } from 'mdast'
+import rehypeKatex from 'rehype-katex'
 import rehypeStringify from 'rehype-stringify'
 import remarkCjkFriendly from 'remark-cjk-friendly'
+import remarkMath from 'remark-math'
 import remarkMdx from 'remark-mdx'
 import remarkParse from 'remark-parse'
 import remarkRehype from 'remark-rehype'
 import { unified } from 'unified'
 import { visit } from 'unist-util-visit'
 import config from 'virtual:config'
+
 import { sortMDByDate } from 'astro-pure/server'
 
 export const prerender = true
@@ -57,9 +60,11 @@ const renderContent = async (post: CollectionEntry<'blog' | 'blogEn'>, site: URL
   const file = await unified()
     .use(remarkParse)
     .use(remarkMdx)
+    .use(remarkMath)
     .use(remarkCjkFriendly)
     .use(remarkReplaceImageLink)
     .use(remarkRehype)
+    .use(rehypeKatex)
     .use(rehypeStringify)
     .process(post.body)
 
