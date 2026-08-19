@@ -1,7 +1,8 @@
 ---
 title: 'From Dot Products to Multi-Head Attention: Chapter 3'
 description: 'Understanding attention scores, QKV projections, causal masks, dropout, and multi-head tensor shapes.'
-publishDate: 2026-08-17
+publishDate: 2026-08-18
+updatedDate: 2026-08-18
 tags:
   - llm
   - pytorch
@@ -15,9 +16,9 @@ comment: false
 
 > **Source note**
 >
-> This article is my study note following Chapter 3, “Coding Attention Mechanisms,” of Sebastian Raschka’s [_Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch). The code comes from the book and its [official Chapter 3 companion code](https://github.com/rasbt/LLMs-from-scratch/tree/main/ch03/01_main-chapter-code). The code remains the author’s work and is distributed under the official repository’s Apache 2.0 license. I preserve the learning sequence here while explaining each step in my own words.
+> This article is my study note following Chapter 3, “Coding Attention Mechanisms,” of Sebastian Raschka’s [_Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch). The code comes from the book and its [official Chapter 3 companion code](https://github.com/rasbt/LLMs-from-scratch/tree/main/ch03/01_main-chapter-code). The code remains the author’s work and is distributed under the official repository’s Apache 2.0 license. Codex generated the first draft from the Jupyter Notebook I wrote while studying, and I revised it afterward.
 
-Chapter 2 produced input vectors with shape `[batch, tokens, embedding]`. Chapter 3 asks a new question: **from which tokens in the same sequence should each token gather information?**
+Chapter 2 produced input vectors with shape `[batch_size, seq_len, embed_dim]`. Chapter 3 asks a new question: **from which tokens in the same sequence should each token gather information?**
 
 The attention pipeline can be summarized as:
 
@@ -49,7 +50,7 @@ inputs = torch.tensor(
 )
 ```
 
-`inputs` has shape `[6, 3]`: six tokens represented by three numbers each. We select the second token as the query.
+`inputs` has shape `[6, 3]`: six tokens represented by three numbers each (`embed_dim = 3`). We select the second token as the query.
 
 ```python
 query = inputs[1]
@@ -129,7 +130,7 @@ This result no longer represents only the second token. It combines information 
 
 ## 2. Computing attention for every token at once
 
-Nested loops could calculate every pairwise dot product, but matrix multiplication is more direct:
+Nested loops could calculate every pairwise dot product, but matrix multiplication is more direct, and PyTorch's vectorized computation is also more efficient:
 
 ```python
 # attn_scores = torch.empty(inputs.shape[0], inputs.shape[0])
@@ -177,6 +178,8 @@ The simple version compared input vectors directly. Real self-attention learns t
 - Key represents the features by which each token can be matched.
 - Value contains the information actually combined after matching.
 
+We will return to why these projections are called query, key, and value after introducing the attention formula.
+
 ```python
 x_2 = inputs[1]
 d_in = inputs.shape[1]
@@ -194,7 +197,7 @@ W_value = torch.nn.Parameter(
 )
 ```
 
-`d_in=3` is the input dimension and `d_out=2` is the projected dimension. `manual_seed` makes initialization reproducible. Gradients are disabled only for this demonstration; these weights must be trainable in the model.
+`d_in=3` is the input dimension and `d_out=2` is the projected dimension. `manual_seed` makes initialization reproducible. Gradients are disabled only for this demonstration (`requires_grad=False`); these weights must be trainable in the model.
 
 ```python
 query_2 = x_2 @ W_query
@@ -240,10 +243,6 @@ tensor([0.1704, 0.1611, 0.1652, 0.1412, 0.2505, 0.1117])
 Context vector 2: tensor([0.2854, 0.4081])
 ```
 
-Dividing by `sqrt(d_k)` keeps dot products from growing too large as dimensionality increases. Very large score differences can make softmax extremely sharp and its gradients too small.
-
-The full operation reads: compare queries and keys with `QK^T`, then use the resulting weights to combine values.
-
 ## 4. Packaging self-attention as a module
 
 ```python
@@ -267,11 +266,6 @@ class SelfAttention_v1(nn.Module):
         context_vecs = attn_weights @ values
         return context_vecs
 ```
-
-- Inheriting from `nn.Module` lets PyTorch register the trainable parameters.
-- `super().__init__()` initializes the parent module.
-- `forward` defines the input-to-output computation. Calling `sa_v1(inputs)` invokes it through PyTorch.
-- The projections, scoring, scaling, softmax, and value aggregation are the same operations as before, now applied to all tokens.
 
 ```python
 torch.manual_seed(123)
@@ -336,7 +330,169 @@ allclose: True
 
 `torch.no_grad()` prevents the manual copy from entering the computation graph. The tiny difference is floating-point rounding; `allclose=True` confirms equality within the chosen tolerances.
 
-## 5. Causal masking: preventing access to the future
+## 5. Discussing the self-attention formula
+
+Query, key, and value are names for the matrices Q, K, and V. By themselves, they are only numerical matrices without intrinsic semantic properties. Section 5.1 discusses why these names make sense, but first we need to make the attention formula precise:
+
+$$
+\operatorname{Attention}(Q, K, V)
+= \operatorname{softmax}\left(\frac{QK^{\mathsf T}}{\sqrt{d_k}}\right)V.
+$$
+
+Here $Q=XW_Q$, $K=XW_K$, and $V=XW_V$. $X$ contains our inputs, with each row representing one token, while $W_Q$, $W_K$, and $W_V$ are learned weight matrices. Unlike the column-vector convention often used in mathematics, PyTorch represents each token as a row vector.
+
+- `nn.Parameter(torch.randn(d_in, d_out))` creates a `(d_in, d_out)` matrix whose entries come from a standard normal distribution.
+- `nn.Linear(d_in, d_out, bias=qkv_bias)` stores its weights as `(d_out, d_in)` and its bias as `(d_out,)`, broadcasting the bias during computation. For example:
+
+```python
+W_query = nn.Linear(d_in, d_out)
+queries = W_query(x)
+```
+
+is internally equivalent to:
+
+```python
+queries = x @ W_query.weight.T + W_query.bias
+```
+
+Therefore, if the mathematical $W_Q$ denotes a `(d_in, d_out)` weight matrix, then
+
+$$
+W_Q = \operatorname{W\_query.weight}^{\mathsf T}.
+$$
+
+This distinction matters when inspecting or extracting the weights directly.
+
+### 5.1 Why are they called query, key, and value?
+
+Formally, multiplying the input X by a weight matrix applies a learned transformation to every token embedding. In this sense, Q, K, and V are simply three different transformations of the same input. Training updates these weights, together with the embeddings, so that the resulting vectors gradually represent useful relationships among the input tokens. Why, then, do we call them query, key, and value?
+
+The answer comes from their roles in the formula:
+
+$$
+(QK^{\mathsf T})_{ij}
+= \sum_{l=1}^{d_k}Q_{il}K_{jl}
+= q_i\cdot k_j.
+$$
+
+Every query $q_i$ is compared with every key $k_j$ through a dot product. At an abstract level, $q_i$ acts like a question—a query—testing which $k_j$ matches it most closely.
+
+Let
+
+$$
+A = \operatorname{softmax}\left(\frac{QK^{\mathsf T}}{\sqrt{d_k}}\right).
+$$
+
+Softmax is applied along the final dimension. Thus, $A_{ij}$ measures how well the key $k_j$ matches the query $q_i$, and for a fixed $i$, $\sum_j A_{ij}=1$.
+
+Why use $QK^{\mathsf T}$ rather than $KQ^{\mathsf T}$? This is not merely about making the matrix shapes compatible; it specifies the direction of information retrieval. The matrix on the left determines who issues each row's query, while the matrix on the right supplies the keys compared within that row. With $QK^{\mathsf T}$, output row $i$ consistently represents token $i$ requesting information from the other tokens. Replacing it with $KQ^{\mathsf T}$ exchanges the query and key roles. Because $W_Q$ and $W_K$ are generally different and softmax is applied row by row, the two operations are not generally equivalent.
+
+Finally, multiply by V:
+
+$$
+C=AV,
+\qquad
+c_i=\sum_j A_{ij}v_j.
+$$
+
+This final step explains the role of values. The query $q_i$ determines what token $i$ is looking for, the key $k_j$ determines how token $j$ can be matched, and the value $v_j$ contains the information actually sent to token $i$ after a match. In short, Q and K decide **where to retrieve information**, while V decides **what information is retrieved**. Query, key, and value are therefore not intrinsic semantic properties of these matrices; they are computational roles that the three projections learn to fulfill.
+
+### 5.2 Why is the scaling factor $\sqrt{d_k}$?
+
+Because of broadcasting, dividing an entire batch by $\sqrt{d_k}$ is equivalent to scaling each example in that batch. We can therefore consider a single sequence and omit the batch dimension from the shape notation:
+
+- $X$ has shape $(\text{seq\_len},\text{embed\_dim})$.
+- $W_Q$ has shape $(\text{embed\_dim},d_k)$.
+- $W_K$ has shape $(\text{embed\_dim},d_k)$.
+- $W_V$ has shape $(\text{embed\_dim},d_v)$.
+- $Q$ has shape $(\text{seq\_len},d_k)$.
+- $K$ has shape $(\text{seq\_len},d_k)$.
+- $V$ has shape $(\text{seq\_len},d_v)$.
+
+Here, $\text{embed\_dim}=d_k=d_v=d_{\text{out}}$. The symbols $d_k$ and $d_v$ are conventional, while `embed_dim` and `d_out` make their roles easier to recognize. Although $QK^{\mathsf T}$ has shape `(seq_len, seq_len)`, its individual entries are
+
+$$
+(QK^{\mathsf T})_{ij}
+= \sum_{l=1}^{d_k}Q_{il}K_{jl}
+= q_i\cdot k_j.
+$$
+
+Each entry is a sum of $d_k$ products, so $d_k$, rather than `seq_len`, controls the scale of an individual score. The question is how the order of these scores changes as $d_k$ grows.
+
+- The standard explanation assumes that the components of $q_i$ and $k_j$ have approximately mean 0 and variance 1. Under the usual independence approximation,
+
+  $$
+  \operatorname{Var}\left(
+    \frac{q_i\cdot k_j}{\sqrt{d_k}}
+  \right)=1.
+  $$
+
+  Before scaling, each score has variance $O(d_k)$ and standard deviation $O(\sqrt{d_k})$. Dividing by $\sqrt{d_k}$ therefore keeps the numerical scale roughly independent of $d_k$.
+
+- A slightly more geometric perspective starts from cosine similarity:
+
+  $$
+  \cos\theta
+  = \frac{q_i\cdot k_j}{\lVert q_i\rVert\lVert k_j\rVert}.
+  $$
+
+  Treat $q_i$ and $k_j$ as random vectors in $d_k$ dimensions. For a vector $x$ whose coordinates remain at constant scale,
+
+  $$
+  \lVert x\rVert
+  = \sqrt{x_1^2+\cdots+x_{d_k}^2}
+  \leq \sqrt{d_k\max_l x_l^2}
+  = O(\sqrt{d_k}).
+  $$
+
+  Normalize the directions as $u=q_i/\lVert q_i\rVert$ and $v=k_j/\lVert k_j\rVert$. The dot product is invariant under rotating the coordinate system, so rotate both vectors until $u=(1,0,\ldots,0)$. Then
+
+  $$
+  \cos\theta=u\cdot v=v_1.
+  $$
+
+  The question becomes:
+
+  > **Question:** If we sample
+  > $v\in\mathbb S^{d_k-1}\subset\mathbb R^{d_k}$ uniformly at random,
+  > how does the order of $v_1$ depend on $d_k$?
+
+  Because $v_1^2+\cdots+v_{d_k}^2=1$ and coordinate-exchange symmetry gives $\mathbb E[v_i^2]=\mathbb E[v_j^2]$,
+
+  $$
+  \mathbb E[v_1^2]=\frac{1}{d_k}.
+  $$
+
+  Jensen's inequality then gives
+
+  $$
+  \mathbb E[|v_1|]
+  = \mathbb E[\sqrt{v_1^2}]
+  \leq \sqrt{\mathbb E[v_1^2]}
+  = \frac{1}{\sqrt{d_k}}.
+  $$
+
+  Therefore,
+
+  $$
+  |\cos\theta|
+  = O\left(\frac{1}{\sqrt{d_k}}\right),
+  $$
+
+  and hence
+
+  $$
+  |q_i\cdot k_j|
+  = \lVert q_i\rVert\lVert k_j\rVert|\cos\theta|
+  = O(\sqrt{d_k})
+    O(\sqrt{d_k})
+    O\left(\frac{1}{\sqrt{d_k}}\right)
+  = O(\sqrt{d_k}).
+  $$
+
+This geometric view does not directly require every coordinate to have mean 0 and variance 1, but it is not assumption-free. It requires the directions of $q_i$ and $k_j$ to be approximately independent and isotropic, and assumes that their average squared coordinates remain at constant scale, giving norms of order $\Theta(\sqrt{d_k})$. These conditions are slightly weaker than specifying the mean and variance of every coordinate, but not dramatically so: both explanations rule out preferred directions or coordinate scales that change with $d_k$. The geometric argument simply focuses on order of magnitude rather than exact variance.
+
+## 6. Causal masking: preventing access to the future
 
 When a generative GPT predicts the next token, it must not use future tokens. A lower-triangular matrix expresses “see only yourself and positions to your left”:
 
@@ -385,7 +541,7 @@ Because `exp(-inf)=0`, future tokens receive zero probability. Every row keeps a
 
 The attention matrix is generally not symmetric: token `i`’s query dotted with token `j`’s key need not equal the reverse query-key comparison.
 
-## 6. Attention dropout
+## 7. Attention dropout
 
 ```python
 torch.manual_seed(123)
@@ -405,7 +561,7 @@ tensor([[2., 2., 0., 2., 2., 0.],
 
 During training, `p=0.5` randomly sets about half the elements to zero. Retained values are scaled from 1 to 2 so their expected value remains unchanged. Applying dropout to attention weights discourages dependence on a fixed set of connections. `model.eval()` disables dropout during evaluation.
 
-## 7. Batched causal attention
+## 8. Batched causal attention
 
 ```python
 class CausalAttention(nn.Module):
@@ -427,14 +583,14 @@ class CausalAttention(nn.Module):
         )
 
     def forward(self, x):
-        b, num_tokens, d_in = x.shape
+        batch_size, seq_len, embed_dim = x.shape
         keys = self.W_key(x)
         queries = self.W_query(x)
         values = self.W_value(x)
 
         attn_scores = queries @ keys.transpose(-2, -1)
         attn_scores.masked_fill_(
-            self.mask.bool()[:num_tokens, :num_tokens],
+            self.mask.bool()[:seq_len, :seq_len],
             -torch.inf
         )
         attn_weights = torch.softmax(
@@ -448,10 +604,10 @@ class CausalAttention(nn.Module):
 
 Important details:
 
-- Input is now three-dimensional: `[batch, tokens, d_in]`.
+- Input is now three-dimensional: `[batch_size, seq_len, embed_dim]`.
 - `transpose(-2, -1)` swaps only the final two dimensions, calculating `QK^T` independently for each batch item.
 - `register_buffer` stores the mask without treating it as a trainable parameter. It still moves with the model between CPU and GPU.
-- `[:num_tokens, :num_tokens]` supports inputs shorter than the configured maximum context length.
+- `[:seq_len, :seq_len]` supports inputs shorter than the configured maximum context length.
 - The underscore in `masked_fill_` indicates an in-place operation.
 
 ```python
@@ -459,9 +615,9 @@ batch = torch.stack((inputs, inputs), dim=0)
 print(batch.shape)
 
 torch.manual_seed(123)
-context_length = batch.shape[1]
+batch_size, seq_len, embed_dim = batch.shape
 ca = CausalAttention(
-    d_in, d_out, context_length, dropout=0.0
+    embed_dim, d_out, seq_len, dropout=0.0
 )
 context_vecs = ca(batch)
 print(context_vecs.shape)
@@ -474,7 +630,7 @@ torch.Size([2, 6, 2])
 
 Two identical `[6, 3]` sequences become `[2, 6, 3]`. Attention projects the final dimension from 3 to 2, producing `[2, 6, 2]`.
 
-## 8. From separate heads to efficient multi-head attention
+## 9. From separate heads to efficient multi-head attention
 
 The most direct multi-head version creates several `CausalAttention` modules and concatenates their results:
 
@@ -535,19 +691,19 @@ class MultiHeadAttention(nn.Module):
         )
 
     def forward(self, x):
-        b, num_tokens, d_in = x.shape
+        batch_size, seq_len, embed_dim = x.shape
         queries = self.W_query(x)
         keys = self.W_key(x)
         values = self.W_value(x)
 
         keys = keys.view(
-            b, num_tokens, self.num_heads, self.head_dim
+            batch_size, seq_len, self.num_heads, self.head_dim
         )
         values = values.view(
-            b, num_tokens, self.num_heads, self.head_dim
+            batch_size, seq_len, self.num_heads, self.head_dim
         )
         queries = queries.view(
-            b, num_tokens, self.num_heads, self.head_dim
+            batch_size, seq_len, self.num_heads, self.head_dim
         )
 
         keys = keys.transpose(1, 2)
@@ -555,7 +711,7 @@ class MultiHeadAttention(nn.Module):
         queries = queries.transpose(1, 2)
 
         attn_scores = queries @ keys.transpose(2, 3)
-        mask_bool = self.mask.bool()[:num_tokens, :num_tokens]
+        mask_bool = self.mask.bool()[:seq_len, :seq_len]
         attn_scores.masked_fill_(mask_bool, -torch.inf)
 
         attn_weights = torch.softmax(
@@ -565,7 +721,7 @@ class MultiHeadAttention(nn.Module):
 
         context_vec = (attn_weights @ values).transpose(1, 2)
         context_vec = context_vec.contiguous().view(
-            b, num_tokens, self.d_out
+            batch_size, seq_len, self.d_out
         )
         context_vec = self.out_proj(context_vec)
         return context_vec
@@ -573,16 +729,16 @@ class MultiHeadAttention(nn.Module):
 
 The shape flow explains the implementation:
 
-| Stage                       | Shape                 |
-| --------------------------- | --------------------- |
-| Input                       | `[B, T, d_in]`        |
-| Projected Q, K, and V       | `[B, T, d_out]`       |
-| Heads split with `view`     | `[B, T, H, head_dim]` |
-| After `transpose(1, 2)`     | `[B, H, T, head_dim]` |
-| Attention scores            | `[B, H, T, T]`        |
-| Context within each head    | `[B, H, T, head_dim]` |
-| Heads transposed and merged | `[B, T, d_out]`       |
-| Output projection           | `[B, T, d_out]`       |
+| Stage                       | Shape                                        |
+| --------------------------- | -------------------------------------------- |
+| Input                       | `[batch_size, seq_len, embed_dim]`           |
+| Projected Q, K, and V       | `[batch_size, seq_len, d_out]`               |
+| Heads split with `view`     | `[batch_size, seq_len, num_heads, head_dim]` |
+| After `transpose(1, 2)`     | `[batch_size, num_heads, seq_len, head_dim]` |
+| Attention scores            | `[batch_size, num_heads, seq_len, seq_len]`  |
+| Context within each head    | `[batch_size, num_heads, seq_len, head_dim]` |
+| Heads transposed and merged | `[batch_size, seq_len, d_out]`               |
+| Output projection           | `[batch_size, seq_len, d_out]`               |
 
 `transpose` usually changes tensor strides without rearranging physical memory, creating a non-contiguous result. `contiguous()` lays out values in the new logical order before `view` merges `H` and `head_dim`. The final `out_proj` learns how to mix information discovered by different heads.
 
@@ -590,10 +746,10 @@ The notebook’s small test produces:
 
 ```python
 torch.manual_seed(123)
-batch_size, context_length, d_in = batch.shape
+batch_size, seq_len, embed_dim = batch.shape
 d_out = 2
 mha = MultiHeadAttention(
-    d_in, d_out, context_length,
+    embed_dim, d_out, seq_len,
     dropout=0.0, num_heads=2
 )
 context_vecs = mha(batch)
@@ -618,7 +774,7 @@ mha_ex = MultiHeadAttention(
 
 Because 768 is divisible by 12, each head has 64 dimensions.
 
-## 9. Final understanding
+## 10. Final understanding
 
 This chapter decomposes “letting tokens exchange information” into inspectable steps:
 

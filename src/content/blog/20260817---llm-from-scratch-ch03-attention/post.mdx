@@ -1,7 +1,8 @@
 ---
 title: '从点积到多头注意力：LLM from Scratch 第 3 章笔记'
 description: '逐步理解注意力分数、QKV、因果遮罩、dropout 与高效多头注意力的张量形状。'
-publishDate: 2026-08-17
+publishDate: 2026-08-18
+updatedDate: 2026-08-18
 tags:
   - llm
   - pytorch
@@ -14,9 +15,9 @@ comment: false
 
 > **来源说明**
 >
-> 本文是我跟随 Sebastian Raschka 的 [_Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch) 第 3 章 “Coding Attention Mechanisms” 所做的学习笔记。代码来自该书及其[官方 Chapter 3 配套代码](https://github.com/rasbt/LLMs-from-scratch/tree/main/ch03/01_main-chapter-code)，版权归原作者所有，并按官方仓库的 Apache 2.0 许可证发布。这里保留代码的学习顺序，并用自己的语言记录每一步的作用。
+> 本文是我跟随 Sebastian Raschka 的 [_Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch) 第 3 章 “Coding Attention Mechanisms” 所做的学习笔记。代码来自该书及其[官方 Chapter 3 配套代码](https://github.com/rasbt/LLMs-from-scratch/tree/main/ch03/01_main-chapter-code)，版权归原作者所有，并按官方仓库的 Apache 2.0 许可证发布。初稿由 Codex 参考我学习时写的 Jupyter Notebook 所生成，之后由我修改。
 
-第 2 章把文本变成了形状为 `[batch, tokens, embedding]` 的输入向量。第 3 章要解决的新问题是：**一个 token 应该从同一序列的哪些 token 中取得信息？**
+第 2 章把文本变成了形状为 `[batch_size, seq_len, embed_dim]` 的输入向量。第 3 章要解决的新问题是：**一个 token 应该从同一序列的哪些 token 中取得信息？**
 
 注意力机制的主线可以概括为：
 
@@ -48,7 +49,7 @@ inputs = torch.tensor(
 )
 ```
 
-`inputs` 的形状是 `[6, 3]`：6 个 token，每个 token 用 3 个数字表示。这里先选择第二个 token 作为 query。
+`inputs` 的形状是 `[6, 3]`：6 个 token，每个 token 用 3 个数字（`embed_dim = 3`）表示。这里先选择第二个 token 作为 query。
 
 ```python
 query = inputs[1]
@@ -71,7 +72,7 @@ tensor([0.9544, 1.4950, 1.4754, 0.8434, 0.7070, 1.0865])
 - `enumerate(inputs)` 依次给出行号 `i` 和输入向量 `x_i`。
 - `torch.dot(x_i, query)` 计算两个向量的点积。点积越大，表示当前输入与 query 在这个向量空间中越匹配。
 
-这些数还是未归一化的分数。第一种简单做法是除以总和：
+这些数还是未归一化的分数。第一种简单的归一化方法是除以总和：
 
 ```python
 attn_weights_2_tmp = attn_scores_2 / attn_scores_2.sum()
@@ -84,7 +85,7 @@ Attention weights: tensor([0.1455, 0.2278, 0.2249, 0.1285, 0.1077, 0.1656])
 Sum: tensor(1.0000)
 ```
 
-权重之和变成了 1，但实际注意力使用 softmax。下面先手写公式，再使用 PyTorch 的稳定实现：
+可以看到每一行的总和变成了 1。在实际的 attention 计算中，我们会使用 softmax。下面先手写公式，再使用 PyTorch 的稳定实现：
 
 ```python
 def softmax_naive(x):
@@ -106,7 +107,7 @@ Attention weights (torch.softmax): tensor([0.1385, 0.2379, 0.2333, 0.1240, 0.108
 Sum (torch.softmax): tensor(1.)
 ```
 
-`torch.exp` 把较大的分数放大为更大的正数，再除以所有指数值之和。`dim=0` 指定沿这个一维张量归一化。实际代码应该优先使用 `torch.softmax`，因为它对很大的数值做了稳定性处理。
+实际代码应该优先使用 `torch.softmax`，因为它对很大的数值做了稳定性处理。
 
 最后，用每个注意力权重乘以对应输入，再求和：
 
@@ -128,7 +129,7 @@ Context vector 2: tensor([0.4419, 0.6515, 0.5683])
 
 ## 2. 同时计算所有 token 的注意力
 
-双重循环可以计算任意两个输入之间的点积，但矩阵乘法更直接：
+双重循环可以计算任意两个输入之间的点积，但矩阵乘法更直接，PyTorch 的向量化计算也更高效：
 
 ```python
 # attn_scores = torch.empty(inputs.shape[0], inputs.shape[0])
@@ -170,11 +171,13 @@ tensor([[0.4421, 0.5931, 0.5790],
 
 ## 3. 引入可训练的 Query、Key 和 Value
 
-前面的简单版本直接比较输入。真正的 self-attention 会先学习三种不同的投影：
+前面的朴素版本直接比较 inputs。真正的 self-attention 会先学习三种不同的投影：
 
 - Query：当前 token 正在寻找什么；
 - Key：每个 token 可以用什么特征被匹配；
 - Value：匹配后真正汇总的内容。
+
+（关于为什么这么想这三个投影，我们结合计算attention的公式以后讨论）
 
 ```python
 x_2 = inputs[1]
@@ -193,7 +196,7 @@ W_value = torch.nn.Parameter(
 )
 ```
 
-`d_in=3` 是输入维度，`d_out=2` 是投影后的维度。`manual_seed` 让随机矩阵可以复现。这里为了演示暂时关闭梯度；正式训练时这些权重需要学习。
+`d_in=3` 是输入维度，`d_out=2` 是投影后的维度。`manual_seed` 让随机矩阵可以复现。这里为了演示暂时关闭梯度（`requires_grad=False`）；训练时这些权重则需要更新。
 
 ```python
 query_2 = x_2 @ W_query
@@ -211,7 +214,7 @@ Keys shape: torch.Size([6, 2])
 Values shape: torch.Size([6, 2])
 ```
 
-代码把 token 当作行向量，因此权重矩阵写在右边：`X @ W`。一个 query 与所有 keys 的点积产生 6 个分数：
+PyTorch 通常把 token 当作行向量，因此权重矩阵写在右边：`X @ W`。一个 query 与所有 keys 的点积产生 6 个分数：
 
 ```python
 attn_scores_2 = query_2 @ keys.T
@@ -239,10 +242,6 @@ tensor([0.1704, 0.1611, 0.1652, 0.1412, 0.2505, 0.1117])
 Context vector 2: tensor([0.2854, 0.4081])
 ```
 
-除以 `sqrt(d_k)` 可以防止点积随维度增大而变得过大。如果 softmax 收到差异极大的分数，它会变得非常尖锐，梯度也可能过小。
-
-整个公式可以读作：先用 `QK^T` 比较 queries 与 keys，再用得到的权重混合 values。
-
 ## 4. 把 self-attention 封装成模块
 
 ```python
@@ -266,11 +265,6 @@ class SelfAttention_v1(nn.Module):
         context_vecs = attn_weights @ values
         return context_vecs
 ```
-
-- 继承 `nn.Module` 后，PyTorch 会登记其中的可训练参数。
-- `super().__init__()` 初始化父类功能。
-- `forward` 定义输入怎样变成输出；调用 `sa_v1(inputs)` 时，PyTorch 会进入这个方法。
-- 三个投影、分数、缩放、softmax 和 value 加权与前面完全相同，只是现在一次处理所有 token。
 
 ```python
 torch.manual_seed(123)
@@ -335,7 +329,154 @@ allclose: True
 
 `torch.no_grad()` 防止这次手动复制进入计算图。极小的差值来自浮点数舍入，`allclose=True` 表示结果在指定误差范围内相同。
 
-## 5. 因果遮罩：不能看到未来
+## 5. 对self-attention公式的讨论
+
+首先，query, key, value是我们对Q, K, V这三个矩阵的叫法，它们自身就只是数字矩阵，并不带有具体的semantic属性。但是为什么这个叫法合理呢？我们会在5.1讨论，
+我们先来理清一下attention的计算公式：
+
+$$
+\operatorname{Attention}(Q, K, V)
+= \operatorname{softmax}\left(\frac{QK^{\mathsf T}}{\sqrt{d_k}}\right)V
+$$
+
+其中 $Q=XW_Q$、$K=XW_K$、$V=XW_V$。$X$ 是我们的 inputs，每一行代表一个 token，$W_Q$、$W_K$、$W_V$
+是要学习更新的权重矩阵。这里需要强调的是，与数学中经常使用列向量的约定不同，PyTorch 使用行向量表示一个 token。
+
+- `nn.Parameter(torch.randn(d_in, d_out))` 生成一个 `(d_in, d_out)` 的矩阵，每个元素都取自标准正态分布。
+- `nn.Linear(d_in, d_out, bias=qkv_bias)` 把 weights 存储为 `(d_out, d_in)`，bias 存储为 `(d_out,)`，并在计算时广播。当我们使用
+
+```python
+W_query = nn.Linear(d_in, d_out)
+queries = W_query(x)
+```
+
+其内部等价于：
+
+```python
+queries = x @ W_query.weight.T + W_query.bias
+```
+
+所以，如果我们把$W_Q$想成`(d_in, d_out)`的weight，那么
+
+$$
+W_Q = \operatorname{W\_query.weight}^{\mathsf T}
+$$
+
+这对我们之后要想观察weights或者单独把weights拿出来很重要。
+
+### 5.1 为什么叫query, key, value
+
+从形式上来看，我们可以把weight matrix和inputs X相乘，看作是对每个token的embedding进行加权。也就是说，Q，K，V，其实就只是三个不同的加权而已。
+而我们的目的是在学习中对这些权重(包括embedding本身)进行更新，使得它们逐渐能够表示inputs里面这些token的某些潜在关系。那么，我们为什么叫它们
+query, key和value呢？我的educated guess是：因为在公式里，
+
+$$
+ (QK^{\mathsf T})_{ij} = \sum_{l = 1}^{d_k} Q_{il}K_{jl} =: q_i \cdot k_j
+$$
+
+即，我们用每个$q_i$去和每个$k_j$做点积，计算similarity。从抽象的层面来上看，这就像是把每个$q_i$当作一个问题(query)，然后去测试
+看它和哪个$k_j$最匹配。
+
+令
+
+$$
+A = \operatorname{softmax}\left(\frac{QK^{\mathsf T}}{\sqrt{d_k}}\right),
+$$
+
+其中softmax沿最后一个维度计算。于是$A_{ij}$表示：对于第$i$个token提出的query $q_i$，第$j$个token的key $k_j$有多匹配；并且对固定的$i$，有$\sum_j A_{ij}=1$。
+
+为什么写成$QK^{\mathsf T}$而不是$KQ^{\mathsf T}$？这并不是单纯为了让shape能够相乘，而是在指定信息查找的方向：放在左边的矩阵决定每一行是谁提出query，放在右边的矩阵决定这一行要和哪些keys比较。$QK^{\mathsf T}$让输出的第$i$行始终对应第$i$个token正在向其他tokens索取信息；如果换成$KQ^{\mathsf T}$，query和key的角色就被交换了。由于$W_Q$和$W_K$通常不同，而且softmax是逐行计算的，这两个结果一般并不等价。
+
+最后再乘以$V$：
+
+$$
+C = AV, \qquad c_i = \sum_j A_{ij}v_j.
+$$
+
+这一步说明了value的角色。$q_i$决定第$i$个token想找什么，$k_j$决定第$j$个token可以怎样被匹配，而$v_j$则是匹配成功后真正传递给第$i$个token的内容。换句话说，Q和K共同决定“从哪里取信息”，V决定“取回什么信息”。所以query、key和value并不是这些矩阵天生具有的semantic属性，而是它们在这套计算中承担的不同角色；训练会逐渐让三个投影适应各自的角色。
+
+### 5.2 为什么scaling factor是$\sqrt{d_k}$
+
+因为broadcasting，对一整个batch除以$\sqrt{d_k}$，相当于对batch里每一个example除以$\sqrt{d_k}$，所以我们考虑
+只有一个example的情况（这样在这段的shape的讨论就省了一个dimension，方便记号）。
+$X$ is of shape $(\text{seq\_len}, \text{embed\_dim})$
+
+- $W_Q$ is of shape $(\text{embed\_dim}, d_k)$
+- $W_K$ is of shape $(\text{embed\_dim}, d_k)$
+- $W_V$ is of shape $(\text{embed\_dim}, d_v)$
+- $Q$ is of shape $(\text{seq\_len}, d_k)$
+- $K$ is of shape $(\text{seq\_len}, d_k)$
+- $V$ is of shape $(\text{seq\_len}, d_v)$
+
+在这$\text{embed\_dim} = d_k = d_v = d_{out}$ (`d_k`, `d_v`是传统记号，而`embed_dim`和`d_out`更方便理解它们代表什么)
+所以$QK^{\mathsf T}$的shape是`(seq_len, seq_len)`。我一开始以为这个scaling factor会是像`seq_len`或者
+$\sqrt{\text{seq\_len}}$。但其实仔细去想的话，
+
+$$
+ (QK^{\mathsf T})_{ij} = \sum_{l = 1}^{d_k} Q_{il}K_{jl} =: q_i \cdot k_j
+$$
+
+也就是每个entry是$d_k$个乘积的和，而且$d_k$也是这些量唯一相关的维度。那么问题就是，随着$d_k$增加，这些量是以怎么样的order of $d_k$在增加？
+我没有读过attention is all you need的原文，这里分享一些我自己的看法。
+
+- 如果你问chatgpt或者去网上搜一下，常规的解释是：当每个$q_i$和$k_j$都大致是mean 0和variance 1的时候，很简单就能确认
+
+  $$
+   \operatorname{Var}\left(\frac{q_i \cdot k_j}{\sqrt{d_k}}\right) = 1
+  $$
+
+  即，每个entry的variance是$O(d_k)$, standard deviation是$O(\sqrt{d_k})$。所以当我们这样scale以后，这些数值计算的稳定性基本不会受$d_k$所影响。
+
+- 我认为的一个稍微几何一点的想法： 根据cosine rule,
+  $$
+   \cos{\theta} = \frac{q_i \cdot k_j}{\lVert q_i \rVert \lVert k_j \rVert}
+  $$
+  而$\cos{\theta}$就是所谓的$q_i$和$k_j$的cosine similarity。这里我们可以把$q_i$和$k_j$看作$d_k$维的随机向量。对任何一个这样的向量$v$, 我们有
+  $$
+  \lVert v \rVert = \sqrt{v_1^2 + \ldots v_{d_k}^2} \leq \sqrt{d_k \max_{i} v_i^2}
+  $$
+  所以$\lVert v \rVert = O(\sqrt{d_k})$。然后我们写$ u = q_i / \lVert q_i \rVert$, $ v = k_j / \lVert k_j \rVert$, 并且利用
+  $u \cdot v$这个量是rotationally invariant(当我们旋转整个坐标系，dot product是不会变的)，我们可以将它们一起旋转，直到 $u = (1,0,0,\ldots)$。
+  这时，
+  $$
+  \cos{\theta} = u \cdot v = v_1
+  $$
+  此时，问题就相当于
+  > **问题：** 当我们随机取一个
+  > $v \in \mathbb{S}^{d_k-1} \subset \mathbb{R}^{d_k}$ 时，
+  > $v_1$ 的数量级如何依赖于 $d_k$？
+
+因为 $v_1^2+\cdots+v_{d_k}^2=1$，并且由对称性可知
+$\mathbb{E}[v_i^2]=\mathbb{E}[v_j^2]$，所以
+
+$$
+\mathbb{E}[v_1^2] = \frac{1}{d_k}
+$$
+
+所以，利用Jensen's inequality:
+
+$$
+\mathbb{E}[|v_1|]
+= \mathbb{E}[\sqrt{v_1^2}]
+\leq \sqrt{\mathbb{E}[v_1^2]}
+=\frac{1}{\sqrt{d_k}}.
+$$
+
+所以，
+
+$$
+|\cos(\theta)| = O\left(\frac{1}{\sqrt{d_k}}\right)
+$$
+
+则
+
+$$
+|q_i \cdot k_j| = \lVert q_i \rVert \lVert k_j \rVert |\cos(\theta)| = O(\sqrt{d_k}) \times O(\sqrt{d_k}) \times O(\frac{1}{\sqrt{d_k}}) = O(\sqrt{d_k})
+$$
+
+这个几何观点虽然不直接要求每个坐标都是 mean 0、variance 1，但也并非没有假设：它要求 $q_i$ 与 $k_j$ 的方向近似独立且各向同性，并假设它们的平均平方坐标维持常数量级，因此范数是 $\Theta(\sqrt{d_k})$。这些条件比逐坐标指定 mean 和 variance 稍弱，但并没有弱很多；两种解释本质上都排除了随 $d_k$ 改变的特殊方向或坐标尺度，只是这里关注的是数量级，而不是精确的 variance。
+
+## 6. 因果遮罩：不能看到未来
 
 生成式 GPT 在预测当前位置的下一个 token 时不能使用未来 token。下三角矩阵正好表达“只能看自己与左边”：
 
@@ -384,7 +525,7 @@ tensor([[1.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000],
 
 注意力矩阵通常也不是对称的：token `i` 的 query 与 token `j` 的 key 的点积，不必等于反方向的 query-key 点积。
 
-## 6. Attention dropout
+## 7. Attention dropout
 
 ```python
 torch.manual_seed(123)
@@ -404,7 +545,7 @@ tensor([[2., 2., 0., 2., 2., 0.],
 
 `p=0.5` 在训练时随机把约一半元素设为 0。保留下来的 1 被缩放成 2，使期望值不变。把 dropout 用在注意力权重上，可以降低模型对某些固定连接的依赖。调用 `model.eval()` 后，dropout 会自动关闭。
 
-## 7. 支持批次的因果注意力
+## 8. 支持批次的因果注意力
 
 ```python
 class CausalAttention(nn.Module):
@@ -426,14 +567,14 @@ class CausalAttention(nn.Module):
         )
 
     def forward(self, x):
-        b, num_tokens, d_in = x.shape
+        batch_size, seq_len, embed_dim = x.shape
         keys = self.W_key(x)
         queries = self.W_query(x)
         values = self.W_value(x)
 
         attn_scores = queries @ keys.transpose(-2, -1)
         attn_scores.masked_fill_(
-            self.mask.bool()[:num_tokens, :num_tokens],
+            self.mask.bool()[:seq_len, :seq_len],
             -torch.inf
         )
         attn_weights = torch.softmax(
@@ -447,10 +588,10 @@ class CausalAttention(nn.Module):
 
 关键点：
 
-- 输入现在是三维 `[batch, tokens, d_in]`。
+- 输入现在是三维 `[batch_size, seq_len, embed_dim]`。
 - `transpose(-2, -1)` 只交换最后两个维度，使每个批次分别计算 `QK^T`。
 - `register_buffer` 保存 mask，但不把它当作需要训练的参数；移动模型到 GPU 时，buffer 也会一起移动。
-- `[:num_tokens, :num_tokens]` 允许实际输入短于配置中的最大上下文长度。
+- `[:seq_len, :seq_len]` 允许实际输入短于配置中的最大上下文长度。
 - `masked_fill_` 末尾的下划线表示原地修改张量。
 
 ```python
@@ -458,9 +599,9 @@ batch = torch.stack((inputs, inputs), dim=0)
 print(batch.shape)
 
 torch.manual_seed(123)
-context_length = batch.shape[1]
+batch_size, seq_len, embed_dim = batch.shape
 ca = CausalAttention(
-    d_in, d_out, context_length, dropout=0.0
+    embed_dim, d_out, seq_len, dropout=0.0
 )
 context_vecs = ca(batch)
 print(context_vecs.shape)
@@ -473,7 +614,7 @@ torch.Size([2, 6, 2])
 
 两个相同的 `[6, 3]` 序列被堆叠成 `[2, 6, 3]`。注意力把最后一维从 3 投影为 2，输出因此是 `[2, 6, 2]`。
 
-## 8. 从多个独立 head 到高效多头注意力
+## 9. 从多个独立 head 到高效多头注意力
 
 最直观的多头版本是创建多个 `CausalAttention`，再连接结果：
 
@@ -534,19 +675,19 @@ class MultiHeadAttention(nn.Module):
         )
 
     def forward(self, x):
-        b, num_tokens, d_in = x.shape
+        batch_size, seq_len, embed_dim = x.shape
         queries = self.W_query(x)
         keys = self.W_key(x)
         values = self.W_value(x)
 
         keys = keys.view(
-            b, num_tokens, self.num_heads, self.head_dim
+            batch_size, seq_len, self.num_heads, self.head_dim
         )
         values = values.view(
-            b, num_tokens, self.num_heads, self.head_dim
+            batch_size, seq_len, self.num_heads, self.head_dim
         )
         queries = queries.view(
-            b, num_tokens, self.num_heads, self.head_dim
+            batch_size, seq_len, self.num_heads, self.head_dim
         )
 
         keys = keys.transpose(1, 2)
@@ -554,7 +695,7 @@ class MultiHeadAttention(nn.Module):
         queries = queries.transpose(1, 2)
 
         attn_scores = queries @ keys.transpose(2, 3)
-        mask_bool = self.mask.bool()[:num_tokens, :num_tokens]
+        mask_bool = self.mask.bool()[:seq_len, :seq_len]
         attn_scores.masked_fill_(mask_bool, -torch.inf)
 
         attn_weights = torch.softmax(
@@ -564,7 +705,7 @@ class MultiHeadAttention(nn.Module):
 
         context_vec = (attn_weights @ values).transpose(1, 2)
         context_vec = context_vec.contiguous().view(
-            b, num_tokens, self.d_out
+            batch_size, seq_len, self.d_out
         )
         context_vec = self.out_proj(context_vec)
         return context_vec
@@ -572,16 +713,16 @@ class MultiHeadAttention(nn.Module):
 
 形状变化是理解这段代码的关键：
 
-| 阶段               | 形状                  |
-| ------------------ | --------------------- |
-| 输入               | `[B, T, d_in]`        |
-| Q、K、V 投影       | `[B, T, d_out]`       |
-| `view` 拆分 heads  | `[B, T, H, head_dim]` |
-| `transpose(1, 2)`  | `[B, H, T, head_dim]` |
-| 注意力分数         | `[B, H, T, T]`        |
-| 每个 head 的上下文 | `[B, H, T, head_dim]` |
-| 转置并合并 heads   | `[B, T, d_out]`       |
-| 输出投影           | `[B, T, d_out]`       |
+| 阶段               | 形状                                         |
+| ------------------ | -------------------------------------------- |
+| 输入               | `[batch_size, seq_len, embed_dim]`           |
+| Q、K、V 投影       | `[batch_size, seq_len, d_out]`               |
+| `view` 拆分 heads  | `[batch_size, seq_len, num_heads, head_dim]` |
+| `transpose(1, 2)`  | `[batch_size, num_heads, seq_len, head_dim]` |
+| 注意力分数         | `[batch_size, num_heads, seq_len, seq_len]`  |
+| 每个 head 的上下文 | `[batch_size, num_heads, seq_len, head_dim]` |
+| 转置并合并 heads   | `[batch_size, seq_len, d_out]`               |
+| 输出投影           | `[batch_size, seq_len, d_out]`               |
 
 `transpose` 通常只改变内存步幅，结果不连续。`contiguous()` 按新的逻辑顺序排列内存后，`view` 才能安全合并 `H` 与 `head_dim`。最后的 `out_proj` 学习怎样混合不同 head 提取的信息。
 
@@ -589,10 +730,10 @@ notebook 的小测试结果为：
 
 ```python
 torch.manual_seed(123)
-batch_size, context_length, d_in = batch.shape
+batch_size, seq_len, embed_dim = batch.shape
 d_out = 2
 mha = MultiHeadAttention(
-    d_in, d_out, context_length,
+    embed_dim, d_out, seq_len,
     dropout=0.0, num_heads=2
 )
 context_vecs = mha(batch)
@@ -617,7 +758,7 @@ mha_ex = MultiHeadAttention(
 
 768 可以被 12 整除，因此每个 head 的维度是 64。
 
-## 9. 最终理解
+## 10. 最终理解
 
 这一章把“让 token 彼此交换信息”拆成了可检查的步骤：
 
