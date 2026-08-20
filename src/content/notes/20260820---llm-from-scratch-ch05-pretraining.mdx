@@ -1,0 +1,585 @@
+---
+title: '训练与加载 GPT-2：LLM from Scratch 第 5 章笔记'
+description: '从 next-token loss 和训练循环，到采样、checkpoint，以及加载 OpenAI GPT-2 权重。'
+date: 2026-08-20
+tags:
+  - llm
+  - pytorch
+  - pretraining
+  - book-notes
+language: 'zh-CN'
+type: note
+status: in-progress
+draft: false
+---
+
+> **来源说明**
+>
+> 本文是我跟随 Sebastian Raschka 的 [_Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch) 第 5 章 “Pretraining on Unlabeled Data” 所做的学习笔记。代码来自该书及其[官方 Chapter 5 配套代码](https://github.com/rasbt/LLMs-from-scratch/tree/main/ch05/01_main-chapter-code)，版权归原作者所有，并按官方仓库的 Apache 2.0 许可证发布。初稿由 Codex 参考我学习时写的 Jupyter Notebook 生成。本文不会代替原书，而是记录我对训练流程和权重加载过程的理解。
+
+第 4 章已经组装出了完整的 GPT 模型，但模型参数仍然是随机值。第 5 章要让这个架构真正学会预测语言：
+
+```text
+无标签文本
+  → input tokens 与 next-token targets
+  → GPT logits
+  → cross-entropy loss
+  → 反向传播与 AdamW 更新
+  → 训练后的权重
+  → greedy 或概率采样生成
+```
+
+本章后半部分还介绍了一条更实用的路线：不从头承担大规模预训练的成本，而是把 OpenAI 发布的 GPT-2 权重映射到第 4 章实现的模型中。
+
+## 1. 从尚未训练的模型开始
+
+Notebook 首先复用第 4 章的模型和简单生成函数：
+
+```python
+import torch
+
+from GPTmodel import GPTModel, generate_text_simple
+
+GPT_CONFIG_124M = {
+    "vocab_size": 50257,
+    "context_length": 256,
+    "emb_dim": 768,
+    "n_heads": 12,
+    "n_layers": 12,
+    "drop_rate": 0.1,
+    "qkv_bias": False,
+}
+
+torch.manual_seed(123)
+model = GPTModel(GPT_CONFIG_124M)
+model.eval()
+```
+
+这个架构接近 GPT-2 small，但 Notebook 把 context length 缩短为 256，以降低演示训练所需的显存和计算量。
+
+`torch.manual_seed(123)` 让随机初始化可以复现。`model.eval()` 只是关闭 dropout 等训练期行为，并不会让模型获得任何知识。
+
+随机权重模型生成的只是形式上合法、语义上混乱的 token。文本和 tensor 之间通过两个辅助函数转换：
+
+```python
+import tiktoken
+
+def text_to_token_ids(text, tokenizer):
+    encoded = tokenizer.encode(
+        text,
+        allowed_special={"<|endoftext|>"},
+    )
+    return torch.tensor(encoded).unsqueeze(0)
+
+def token_ids_to_text(token_ids, tokenizer):
+    flat = token_ids.squeeze(0)
+    return tokenizer.decode(flat.tolist())
+```
+
+| 转换方向             | shape 或类型变化              |
+| -------------------- | ----------------------------- |
+| 文本 → tokenizer     | Python 字符串 → token ID 列表 |
+| 列表 → 模型输入      | `[seq_len]` → `[1, seq_len]`  |
+| 模型输出 → tokenizer | `[1, seq_len]` → 一维列表     |
+| tokenizer → 文本     | token ID → Python 字符串      |
+
+`unsqueeze(0)` 增加的是 batch 维度，这是 `GPTModel` 所要求的输入格式。
+
+## 2. 把 next-token prediction 变成 loss
+
+语言模型预训练不需要人工逐条标注。只要把原始文本错开一个 token，就能从文本自身构造监督信号：
+
+```text
+input:   Every  effort  moves  you
+target:  effort moves   you    forward
+```
+
+每个位置的任务都是预测下一个 token。若输入 shape 为 `[batch_size, seq_len]`，模型输出 logits 的 shape 为：
+
+```text
+[batch_size, seq_len, vocab_size]
+```
+
+GPT-2 的 `vocab_size = 50,257`，因此序列中的每个位置都会产生 50,257 个未经归一化的分数。
+
+Notebook 使用 cross-entropy：
+
+```python
+def calc_loss_batch(input_batch, target_batch, model, device):
+    input_batch = input_batch.to(device)
+    target_batch = target_batch.to(device)
+
+    logits = model(input_batch)
+    loss = torch.nn.functional.cross_entropy(
+        logits.flatten(0, 1),
+        target_batch.flatten(),
+    )
+    return loss
+```
+
+关键在于把 batch 维和 sequence 维合并：
+
+```text
+logits:  [batch, seq_len, vocab_size]
+          ↓ 合并第 0、1 维
+         [batch × seq_len, vocab_size]
+
+targets: [batch, seq_len]
+          ↓ 展平
+         [batch × seq_len]
+```
+
+这样，每一个 token 位置都变成一个 50,257 分类问题。Cross-entropy 内部会执行 log-softmax，取出正确 token 的 log probability，再计算负值并求平均。
+
+Loss 越低，表示模型分给真实 next token 的概率越高。它还可以转换为 perplexity：
+
+$$
+\text{perplexity} = e^{\text{loss}}.
+$$
+
+随机模型的预测接近均匀分布，理论 loss 大约为 $\ln(50{,}257) \approx 10.82$。Notebook 最初得到约 10.99，符合尚未学习时的状态。
+
+## 3. 准备训练集与验证集
+
+示例语料仍然是 Edith Wharton 的短篇小说 “The Verdict”。Notebook 中共有 5,145 个 GPT-2 tokens。
+
+```python
+with open("the-verdict.txt", "r", encoding="utf-8") as f:
+    text_data = f.read()
+
+train_ratio = 0.90
+split_idx = int(len(text_data) * train_ratio)
+train_data = text_data[:split_idx]
+val_data = text_data[split_idx:]
+```
+
+这里先切分原始文本，再分别创建 sliding windows。这样验证区间中的文本不会提前出现在训练样本里。
+
+```python
+from create_dataloader import create_dataloader_v1
+
+torch.manual_seed(123)
+train_loader = create_dataloader_v1(
+    train_data,
+    batch_size=2,
+    max_length=GPT_CONFIG_124M["context_length"],
+    stride=GPT_CONFIG_124M["context_length"],
+    drop_last=True,
+    shuffle=True,
+    num_workers=0,
+)
+
+val_loader = create_dataloader_v1(
+    val_data,
+    batch_size=2,
+    max_length=GPT_CONFIG_124M["context_length"],
+    stride=GPT_CONFIG_124M["context_length"],
+    drop_last=True,
+    shuffle=False,
+    num_workers=0,
+)
+```
+
+训练集需要 shuffle；验证集保持稳定顺序。`stride` 与 context length 相同，表示相邻窗口之间不重叠。
+
+这份语料非常小，适合观察训练机制，却远不足以训练一个具有通用语言能力的 LLM。
+
+## 4. 计算整个 DataLoader 的平均 loss
+
+`calc_loss_loader` 把多个 batch 的 loss 汇总起来：
+
+```python
+def calc_loss_loader(data_loader, model, device, num_batches=None):
+    total_loss = 0.0
+
+    if len(data_loader) == 0:
+        return float("nan")
+
+    if num_batches is None:
+        num_batches = len(data_loader)
+    else:
+        num_batches = min(num_batches, len(data_loader))
+
+    for i, (input_batch, target_batch) in enumerate(data_loader):
+        if i >= num_batches:
+            break
+        loss = calc_loss_batch(
+            input_batch,
+            target_batch,
+            model,
+            device,
+        )
+        total_loss += loss.item()
+
+    return total_loss / num_batches
+```
+
+`num_batches` 可以限制评估范围。在训练过程中频繁评估时，只抽取几个 batch 会更快；训练结束后再计算完整数据集。
+
+Notebook 中的初始结果为：
+
+| 数据集     | 初始 loss |
+| ---------- | --------: |
+| Training   |    10.988 |
+| Validation |    10.981 |
+
+训练前两者都面对同一个随机模型，因此 loss 接近是正常的。
+
+## 5. 把 evaluation 与 training 分开
+
+评估时不应使用 dropout，也不需要构建 gradient graph：
+
+```python
+def evaluate_model(model, train_loader, val_loader, device, eval_iter):
+    model.eval()
+    with torch.no_grad():
+        train_loss = calc_loss_loader(
+            train_loader, model, device, num_batches=eval_iter
+        )
+        val_loss = calc_loss_loader(
+            val_loader, model, device, num_batches=eval_iter
+        )
+    model.train()
+    return train_loss, val_loss
+```
+
+这里有三个不同作用：
+
+- `model.eval()` 把 dropout 等 module 切换到评估行为。
+- `torch.no_grad()` 不记录自动微分图，减少显存占用。
+- `model.train()` 在返回训练循环前恢复训练行为。
+
+最后一行必须带括号。只写 `model.train` 得到的是 method object，并没有真正调用它。
+
+## 6. 训练循环
+
+PyTorch 已经负责自动微分，因此核心训练循环并不长：
+
+```python
+def train_model_simple(
+    model,
+    train_loader,
+    val_loader,
+    optimizer,
+    device,
+    num_epochs,
+    eval_freq,
+    eval_iter,
+    start_context,
+    tokenizer,
+):
+    train_losses, val_losses, track_tokens_seen = [], [], []
+    tokens_seen, global_step = 0, -1
+
+    for epoch in range(num_epochs):
+        model.train()
+
+        for input_batch, target_batch in train_loader:
+            optimizer.zero_grad()
+            loss = calc_loss_batch(
+                input_batch, target_batch, model, device
+            )
+            loss.backward()
+            optimizer.step()
+
+            tokens_seen += input_batch.numel()
+            global_step += 1
+
+            if global_step % eval_freq == 0:
+                train_loss, val_loss = evaluate_model(
+                    model,
+                    train_loader,
+                    val_loader,
+                    device,
+                    eval_iter,
+                )
+                train_losses.append(train_loss)
+                val_losses.append(val_loss)
+                track_tokens_seen.append(tokens_seen)
+                print(
+                    f"Ep {epoch + 1} (Step {global_step:06d}): "
+                    f"Train loss {train_loss:.3f}, "
+                    f"Val loss {val_loss:.3f}"
+                )
+
+        generate_and_print_sample(
+            model, tokenizer, device, start_context
+        )
+
+    return train_losses, val_losses, track_tokens_seen
+```
+
+每个 batch 有四个核心步骤：
+
+1. `optimizer.zero_grad()` 清除上一个 batch 留下的 gradient。
+2. Forward pass 和 cross-entropy 得到一个标量 loss。
+3. `loss.backward()` 为所有可训练参数计算 gradient。
+4. `optimizer.step()` 根据 gradient 更新参数。
+
+Notebook 使用 AdamW：
+
+```python
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=0.0004,
+    weight_decay=0.1,
+)
+```
+
+AdamW 会为不同参数自适应调整更新尺度；weight decay 则抑制权重无约束地增大。
+
+## 7. 如何阅读训练信号
+
+Notebook 运行时，training loss 很快下降。生成内容也经历了一个明显变化：随机片段逐渐变成标点、常用词的重复，最后开始模仿这篇短篇小说。
+
+这同时说明两件事：
+
+- 优化流程有效，模型确实学到了统计模式。
+- 语料太小时，模型更容易记住训练文本，而不是形成广泛的语言能力。
+
+Training loss 和 validation loss 必须一起看。如果 training loss 持续下降，但 validation loss 停止下降甚至上升，说明模型越来越擅长训练文本，却没有在未见文本上继续改善。
+
+定期生成 sample 属于定性检查。Loss 是优化目标；sample 则可以暴露单个标量难以展示的重复、语义混乱和记忆问题。
+
+## 8. Temperature 与 top-k sampling
+
+Greedy decoding 每次都选最大 logit，结果稳定，但很容易重复。第 5 章加入两个采样控制：
+
+```python
+def generate(
+    model,
+    idx,
+    max_new_tokens,
+    context_size,
+    temperature=0.0,
+    top_k=None,
+    eos_id=None,
+):
+    for _ in range(max_new_tokens):
+        idx_cond = idx[:, -context_size:]
+
+        with torch.no_grad():
+            logits = model(idx_cond)
+
+        logits = logits[:, -1, :]
+
+        if top_k is not None:
+            top_logits, _ = torch.topk(logits, top_k)
+            threshold = top_logits[:, -1]
+            logits = torch.where(
+                logits < threshold,
+                torch.tensor(float("-inf"), device=logits.device),
+                logits,
+            )
+
+        if temperature > 0.0:
+            logits = logits / temperature
+            probs = torch.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+        else:
+            idx_next = torch.argmax(
+                logits,
+                dim=-1,
+                keepdim=True,
+            )
+
+        if eos_id is not None and (idx_next == eos_id).all():
+            break
+
+        idx = torch.cat((idx, idx_next), dim=1)
+
+    return idx
+```
+
+### Temperature
+
+Temperature 在 softmax 之前缩放 logits：
+
+$$
+p_i = \operatorname{softmax}\left(\frac{z_i}{T}\right).
+$$
+
+- `T < 1` 使分布更尖锐，高概率 token 更占优势。
+- `T = 1` 不改变原始分布。
+- `T > 1` 使分布更平坦，增加多样性。
+- `T = 0` 不能直接参与除法，因此代码单独使用 argmax。
+
+### Top-k
+
+Top-k 只保留最大的 `k` 个 logits，其他值全部设为负无穷。Softmax 之后，被过滤的 token 概率就是 0。
+
+Temperature 调整候选 token 之间的相对概率；top-k 则直接决定哪些 token 有资格参与采样。两者配合，可以在多样性和稳定性之间取得平衡。
+
+## 9. 保存与恢复 checkpoint
+
+`state_dict` 是从参数名称到 tensor 的映射：
+
+```python
+torch.save(model.state_dict(), "model.pth")
+
+restored_model = GPTModel(GPT_CONFIG_124M)
+state = torch.load("model.pth", map_location=device)
+restored_model.load_state_dict(state)
+restored_model.eval()
+```
+
+如果还要从原位置继续训练，就应同时保存 optimizer state：
+
+```python
+torch.save(
+    {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    },
+    "model_and_optimizer.pth",
+)
+```
+
+Optimizer state 包含 AdamW 的 moving averages 和 step counters。只加载模型参数足够进行 inference，却不能完整恢复之前的优化过程。
+
+模型配置同样是 checkpoint contract 的一部分。Embedding size、layer count 或 vocabulary size 不一致时，state dictionary 无法加载到目标架构中。
+
+## 10. 让架构与已发布的 GPT-2 匹配
+
+书中的下载工具会返回 OpenAI GPT-2 checkpoint 的配置和数组。加载前必须先创建 shape 完全匹配的模型：
+
+```python
+model_configs = {
+    "gpt2-small (124M)": {
+        "emb_dim": 768,
+        "n_layers": 12,
+        "n_heads": 12,
+    },
+    "gpt2-medium (355M)": {
+        "emb_dim": 1024,
+        "n_layers": 24,
+        "n_heads": 16,
+    },
+    "gpt2-large (774M)": {
+        "emb_dim": 1280,
+        "n_layers": 36,
+        "n_heads": 20,
+    },
+    "gpt2-xl (1558M)": {
+        "emb_dim": 1600,
+        "n_layers": 48,
+        "n_heads": 25,
+    },
+}
+
+model_name = "gpt2-small (124M)"
+new_config = GPT_CONFIG_124M.copy()
+new_config.update(model_configs[model_name])
+new_config.update({
+    "context_length": 1024,
+    "qkv_bias": True,
+})
+
+gpt = GPTModel(new_config)
+```
+
+它与本地演示训练的配置有两个重要差别：
+
+- OpenAI 发布的 GPT-2 context length 是 1,024。
+- Query、key、value projection 都带 bias。
+
+只有目标 tensor 与 checkpoint 中的来源 tensor shape 一致时，权重才能正确加载。
+
+## 11. 分配并翻译 checkpoint 权重
+
+一个小型辅助函数让 shape mismatch 直接报错：
+
+```python
+def assign(left, right):
+    if left.shape != right.shape:
+        raise ValueError(
+            f"Shape mismatch: left {left.shape}, right {right.shape}"
+        )
+    return torch.nn.Parameter(torch.tensor(right))
+```
+
+OpenAI 原始 TensorFlow checkpoint 与第 4 章的 PyTorch 模型对部分权重采用了不同布局。因此 loading function 不只是复制数据，还承担格式翻译。
+
+最重要的例子是合并存储的 QKV projection：
+
+```python
+q_w, k_w, v_w = np.split(
+    params["blocks"][b]["attn"]["c_attn"]["w"],
+    3,
+    axis=-1,
+)
+
+gpt.trf_blocks[b].att.W_query.weight = assign(
+    gpt.trf_blocks[b].att.W_query.weight,
+    q_w.T,
+)
+```
+
+GPT-2 small 中，这个合并矩阵的 shape 为 `[768, 2304]`，其中 `2304 = 3 × 768`。沿最后一维切成三份，就得到 query、key、value 各自的矩阵。
+
+Transpose 的原因是两个框架的 linear weight 排列方式不同：
+
+| 表示方式                   | Linear weight layout                |
+| -------------------------- | ----------------------------------- |
+| TensorFlow checkpoint      | `[input_features, output_features]` |
+| PyTorch `nn.Linear.weight` | `[output_features, input_features]` |
+
+完整映射关系为：
+
+| OpenAI checkpoint | 第 4 章 GPT 模型                 |
+| ----------------- | -------------------------------- |
+| `wpe`             | `pos_emb.weight`                 |
+| `wte`             | `tok_emb.weight`                 |
+| `attn.c_attn.w`   | query、key、value weights        |
+| `attn.c_attn.b`   | query、key、value biases         |
+| `attn.c_proj`     | attention output projection      |
+| `mlp.c_fc`        | 第一个 feed-forward linear layer |
+| `mlp.c_proj`      | 第二个 feed-forward linear layer |
+| `ln_1`            | 第一个 block normalization       |
+| `ln_2`            | 第二个 block normalization       |
+| 顶层 `g` 与 `b`   | final normalization              |
+| 再次使用 `wte`    | output head                      |
+
+Feed-forward 中只需要加载 index 0 和 2，因为 index 1 是没有可训练参数的 GELU。
+
+Output head 再次使用 `wte`，体现了 weight tying：token embedding 与输出投影共享同一份 vocabulary representation。
+
+## 12. 从随机输出到 pretrained output
+
+加载 GPT-2 权重后，同一个 prompt 会产生连贯得多的语言。Notebook 中从 “Every effort moves you” 开始采样，得到：
+
+> Every effort moves you toward finding an ideal new way to practice something!
+
+这个变化并不是因为 Python class 被彻底改写。架构基本相同，真正储存模型能力的是经过训练得到的参数值。
+
+本章的主线可以归纳为：
+
+```text
+architecture 决定模型能学什么
+data 提供学习信号
+optimization 改变参数
+parameters 储存学到的行为
+decoding 决定预测如何变成文本
+```
+
+## 13. 最终理解
+
+我在这一章得到的主要认识是：
+
+1. 只需把普通文本错开一个 token，就能构造语言模型训练目标。
+2. Cross-entropy 会把每个位置的 vocabulary logits 与真实 next token 比较。
+3. 训练循环反复执行 forward、loss、backpropagation 和 optimizer update。
+4. Training loss、validation loss 与生成样本分别反映训练的不同侧面。
+5. Temperature 与 top-k 改变的是 decoding，而不是模型已经学到的权重。
+6. 可用的 checkpoint 必须带有兼容的架构信息；继续训练时还需要 optimizer state。
+7. 加载 GPT-2 权重需要明确映射 TensorFlow checkpoint arrays 与 PyTorch parameters。
+
+第 6 章将在这些 pretrained GPT-2 权重之上，把模型适配到一个 supervised classification task。
+
+## 参考资料
+
+- [Build a Large Language Model (From Scratch)](https://www.manning.com/books/build-a-large-language-model-from-scratch)
+- [官方 LLMs-from-scratch GitHub 仓库](https://github.com/rasbt/LLMs-from-scratch)
+- [官方 Chapter 5 notebook](https://github.com/rasbt/LLMs-from-scratch/blob/main/ch05/01_main-chapter-code/ch05.ipynb)
+- [PyTorch cross-entropy 文档](https://pytorch.org/docs/stable/generated/torch.nn.functional.cross_entropy.html)
+- [PyTorch 保存与加载模型教程](https://pytorch.org/tutorials/beginner/saving_loading_models.html)
