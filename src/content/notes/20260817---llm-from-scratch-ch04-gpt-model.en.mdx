@@ -1,21 +1,22 @@
 ---
 title: 'Assembling a GPT Model: Chapter 4 Study Notes'
 description: 'Building a GPT-2 small-style architecture from LayerNorm, GELU, residual paths, and Transformer blocks.'
-publishDate: 2026-08-20
+date: 2026-08-20
 tags:
   - llm
   - pytorch
   - transformer
   - book-notes
 language: 'en'
-translationKey: '20260817---llm-from-scratch-ch04-gpt-model/post'
+translationKey: '20260817---llm-from-scratch-ch04-gpt-model'
+type: note
+status: ready
 draft: false
-comment: false
 ---
 
 > **Source note**
 >
-> This article is my study note following Chapter 4, “Implementing a GPT Model from Scratch to Generate Text,” of Sebastian Raschka’s [_Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch). The code comes from the book and its [official Chapter 4 companion code](https://github.com/rasbt/LLMs-from-scratch/tree/main/ch04/01_main-chapter-code). The code remains the author’s work and is distributed under the official repository’s Apache 2.0 license. This post does not replace the book; it records how I understand each component and the tensor flow through the complete model.
+> This article is my study note following Chapter 4, “Implementing a GPT Model from Scratch to Generate Text,” of Sebastian Raschka’s [_Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch). The code comes from the book and its [official Chapter 4 companion code](https://github.com/rasbt/LLMs-from-scratch/tree/main/ch04/01_main-chapter-code). The code remains the author’s work and is distributed under the official repository’s Apache 2.0 license. This note does not replace the book; it records how I understand each component and the tensor flow through the complete model.
 
 Chapter 3 implemented multi-head causal attention. Chapter 4 combines it with the remaining pieces of a GPT model:
 
