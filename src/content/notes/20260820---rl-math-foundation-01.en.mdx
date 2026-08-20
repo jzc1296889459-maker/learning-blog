@@ -1,0 +1,309 @@
+---
+title: 'Basic notions in reinforcement learning'
+description: 'States, Actions, Rewards and the Bellman equation.'
+date: 2026-08-20
+updatedDate: 2026-08-20
+tags:
+  - RL
+  - book-notes
+language: 'en'
+translationKey: '20260820---rl-math-foundation-01'
+type: note
+status: in-progress
+draft: false
+---
+
+> **Source note**
+> This is my study note on reinforcement learning. The theoretical part mainly follows
+> _Mathematical Foundations of Reinforcement Learning_ by Shiyu Zhao and
+> _Reinforcement Learning: An Introduction_ by Sutton and Barto. The coding part mainly follows
+> _动手学强化学习_ by a team from Shanghai Jiao Tong University.
+
+## Preliminaries: measure-theoretic probability
+
+A probability space is a triple $(\Omega, \mathcal{F}, \mathbb{P})$:
+
+- $\Omega$ is the set of possible outcomes.
+- $\mathcal{F}$ is a $\sigma$-algebra of measurable events, closed under complements and countable
+  unions.
+- $\mathbb{P}$ is a probability measure on those events.
+
+A random variable is a measurable map $X : \Omega \to \mathcal{X}$. Its distribution (or
+law) is the pushforward measure
+
+$$
+\mu_X(A) = \mathbb{P}(X \in A), \qquad A \subseteq \mathcal{X}.
+$$
+
+For an integrable function $f$, expectation is an integral with respect to a probability
+measure:
+
+$$
+\mathbb{E}[f(X)]
+= \int_\Omega f(X(\omega))\,\mathbb{P}(d\omega)
+= \int_\mathcal{X} f(x)\,\mu_X(dx).
+$$
+
+If $X$ has finite or countable support, the same integral is a sum:
+
+$$
+\mathbb{E}[f(X)]
+=\sum_{x\in\mathcal{X}}f(x)\,\mathbb{P}(X=x).
+$$
+
+A probability mass function or density $p(x)$ is a representation of a measure relative to
+counting or Lebesgue measure; not every probability measure needs to have a density. Statements
+that hold outside a set of probability zero hold **almost surely**, abbreviated a.s.
+
+### Transition kernels and measures on paths
+
+Let $(\mathcal{X},\mathscr{X})$ and $(\mathcal{Y},\mathscr{Y})$ be measurable spaces. A
+**stochastic kernel** $K$ from $\mathcal{X}$ to $\mathcal{Y}$ assigns a probability distribution
+$K(x,\cdot)$ on $\mathcal{Y}$ to every $x\in\mathcal{X}$, with two requirements:
+
+1. $B\mapsto K(x,B)$ is a probability measure for each fixed $x$.
+2. $x\mapsto K(x,B)$ is measurable for each fixed $B\in\mathscr{Y}$.
+
+We often write $K(x,dy)$. A Markov transition kernel is simply a stochastic kernel from the
+current state space to the next state space.
+
+On a finite space, define $K(x,y)=K(x,\{y\})$. Then
+
+$$
+\sum_{y\in\mathcal{Y}}K(x,y)=1,
+\qquad
+\int_\mathcal{Y}g(y)K(x,dy)
+=\sum_{y\in\mathcal{Y}}g(y)K(x,y).
+$$
+
+An initial distribution and a sequence of kernels determine a probability measure on an infinite
+product space. More precisely, let $\mu_0$ be a distribution on $\mathcal{X}_0$, and let
+
+$$
+K_t(x_0,\ldots,x_t,dx_{t+1})
+$$
+
+be a kernel that selects the next coordinate given the history. The Ionescu–Tulcea theorem gives
+a unique probability measure $\mathbb{P}$ on
+$\Omega=\prod_{t=0}^{\infty}\mathcal{X}_t$ whose probabilities on cylinder events are obtained by
+iterated integration:
+
+$$
+\begin{aligned}
+&\mathbb{P}(X_0\in A_0,\ldots,X_n\in A_n) \\
+&\quad=
+\int_{A_0}\mu_0(dx_0)
+\int_{A_1}K_0(x_0,dx_1)\cdots
+\int_{A_n}K_{n-1}(x_0,\ldots,x_{n-1},dx_n).
+\end{aligned}
+$$
+
+For a time-homogeneous Markov chain, the next-state kernel depends only on the current state:
+$K_t(x_0,\ldots,x_t,dx_{t+1})=K(x_t,dx_{t+1})$. On a finite state space this reduces to
+
+$$
+\mathbb{P}(X_0=x_0,\ldots,X_n=x_n)
+=\mu_0(x_0)\prod_{t=0}^{n-1}K(x_t,x_{t+1}).
+$$
+
+In RL, a policy $\pi(da\mid s)$ and an environment kernel $P(ds'\mid s,a)$ alternate:
+
+$$
+\mu_0(ds_0)\,
+\pi(da_0\mid s_0)\,
+P(ds_1\mid s_0,a_0)\,
+\pi(da_1\mid s_1)\,
+P(ds_2\mid s_1,a_1)\cdots.
+$$
+
+For finite state and action spaces, the probability of a finite trajectory prefix is therefore
+
+$$
+\mathbb{P}_{\mu_0}^{\pi}
+(S_0=s_0,A_0=a_0,\ldots,A_{n-1}=a_{n-1},S_n=s_n)
+=\mu_0(s_0)\prod_{t=0}^{n-1}
+\pi(a_t\mid s_t)P(s_{t+1}\mid s_t,a_t).
+$$
+
+Their iterated integrals define a unique probability law
+$\mathbb{P}_{\mu_0}^{\pi}$ on trajectories
+$\tau=(S_0,A_0,S_1,A_1,\ldots)$. This is the object hidden by informal expressions such as
+$\tau\sim p_\pi$ or $\mathbb{E}_\pi$.
+
+### Conditional probability and conditional expectation
+
+Let $X$ be integrable and let $\mathcal{G}\subseteq\mathcal{F}$ represent the information currently
+available. A conditional expectation $Z=\mathbb{E}[X\mid\mathcal{G}]$ is a
+$\mathcal{G}$-measurable random variable satisfying
+
+$$
+\int_G Z\,d\mathbb{P}=\int_G X\,d\mathbb{P}
+\qquad\text{for every }G\in\mathcal{G}.
+$$
+
+It is unique up to almost-sure equality. On the standard Borel spaces normally used in RL, we can
+also use a regular conditional distribution $K_{X\mid Y}(y,dx)$. For suitable $g$,
+
+$$
+\mathbb{E}[g(X)\mid Y]
+=\int_\mathcal{X}g(x)K_{X\mid Y}(Y,dx).
+$$
+
+When $X$ is discrete, this becomes the familiar conditional sum
+
+$$
+\mathbb{E}[g(X)\mid Y=y]
+=\sum_{x\in\mathcal{X}}g(x)\mathbb{P}(X=x\mid Y=y).
+$$
+
+The rules used most often are:
+
+- **Linearity:**
+  $\mathbb{E}[aX+bY\mid\mathcal{G}]
+  =a\mathbb{E}[X\mid\mathcal{G}]+b\mathbb{E}[Y\mid\mathcal{G}]$.
+- **Taking out what is known:** if $Y$ is $\mathcal{G}$-measurable, then
+  $\mathbb{E}[YX\mid\mathcal{G}]=Y\mathbb{E}[X\mid\mathcal{G}]$ whenever the terms are integrable.
+- **Tower property:** if $\mathcal{H}\subseteq\mathcal{G}$, then
+  $\mathbb{E}[\mathbb{E}[X\mid\mathcal{G}]\mid\mathcal{H}]
+  =\mathbb{E}[X\mid\mathcal{H}]$.
+- **Total expectation:**
+  $\mathbb{E}[\mathbb{E}[X\mid\mathcal{G}]]=\mathbb{E}[X]$.
+- **Independence:** if $X$ is independent of $\mathcal{G}$, then
+  $\mathbb{E}[X\mid\mathcal{G}]=\mathbb{E}[X]$ a.s.
+
+#### Laws of total probability and total expectation
+
+For a countable partition $(B_i)_i$ with $\mathbb{P}(B_i)>0$,
+
+$$
+\mathbb{P}(A)=\sum_i\mathbb{P}(A\mid B_i)\mathbb{P}(B_i),
+\qquad
+\mathbb{E}[X]=\sum_i\mathbb{E}[X\mid B_i]\mathbb{P}(B_i).
+$$
+
+Equivalently, if $Y$ is discrete,
+
+$$
+\begin{aligned}
+\mathbb{P}(X\in A)
+  &=\sum_y\mathbb{P}(X\in A\mid Y=y)\mathbb{P}(Y=y),\\
+\mathbb{E}[g(X)]
+  &=\sum_y\mathbb{E}[g(X)\mid Y=y]\mathbb{P}(Y=y).
+\end{aligned}
+$$
+
+For a general conditioning variable, sums become integrals against its law $\mu_Y$:
+
+$$
+\begin{aligned}
+\mathbb{P}(X\in A)
+  &=\int K_{X\mid Y}(y,A)\,\mu_Y(dy),\\
+\mathbb{E}[g(X)]
+  &=\int \mathbb{E}[g(X)\mid Y=y]\,\mu_Y(dy).
+\end{aligned}
+$$
+
+If $Y$ has density $f_Y$, then $\mu_Y(dy)=f_Y(y)dy$. If a conditional density also exists, the
+continuous law of total probability is often written
+
+$$
+f_X(x)=\int f_{X\mid Y}(x\mid y)f_Y(y)\,dy.
+$$
+
+### Probability notation versus ML/RL notation
+
+ML and RL notation usually emphasizes how a sample is generated. It is shorthand for integration
+against the corresponding probability measure, not a different definition of expectation.
+
+| Probability language                             | Common ML/RL notation                                               | Meaning                                                                                                          |
+| ------------------------------------------------ | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| $\int f(x)\,\mu(dx)$                             | $\mathbb{E}_{x\sim p}[f(x)]$                                        | Integrate $f$ against the law denoted informally by $p$.                                                         |
+| The policy kernel $\pi(s,da)$                    | $a\sim\pi(\cdot\mid s)$                                             | Sample an action from the distribution assigned to state $s$.                                                    |
+| $\mathbb{E}_{\mathbb{P}_{\mu_0}^{\pi}}[F(\tau)]$ | $\mathbb{E}_\pi[F(\tau)]$ or $\mathbb{E}_{\tau\sim p_\pi}[F(\tau)]$ | Integrate over the trajectory law constructed above; the environment and initial distribution are often omitted. |
+| $\int f(s,a)d^\pi(ds)\pi(da\mid s)$              | $\mathbb{E}_{s\sim d^\pi,\,a\sim\pi(\cdot\mid s)}[f(s,a)]$          | Integrate under the state-occupancy law and then the policy.                                                     |
+| $\mathbb{E}[f(X)]$                               | $\frac{1}{N}\sum_{i=1}^N f(x_i)$                                    | Approximate the expectation by a Monte Carlo sample average.                                                     |
+
+For finite $\mathcal{S}$ and $\mathcal{A}$, the occupancy-measure row becomes
+
+$$
+\mathbb{E}_{s\sim d^\pi,\,a\sim\pi(\cdot\mid s)}[f(s,a)]
+=\sum_{s\in\mathcal{S}}d^\pi(s)
+\sum_{a\in\mathcal{A}}\pi(a\mid s)f(s,a).
+$$
+
+For example, the value of a policy can be written compactly as
+
+$$
+V^\pi(s)
+= \mathbb{E}_\pi\!\left[\sum_{t=0}^{\infty}\gamma^t R_t
+  \;\middle|\; S_0=s\right].
+$$
+
+The subscript $\pi$ therefore does not mean that the policy is the only random object. It names the
+policy-dependent trajectory law while suppressing the initial distribution, transition kernel, and
+possibly a reward kernel.
+
+### A rigorous definition of an MDP
+
+These ingredients now let us define an infinite-horizon discounted Markov decision process. An MDP
+consists of:
+
+- a measurable state space $(\mathcal{S},\mathscr{S})$;
+- a measurable action space $(\mathcal{A},\mathscr{A})$;
+- a transition kernel $P(ds'\mid s,a)$ from $\mathcal{S}\times\mathcal{A}$ to $\mathcal{S}$;
+- a measurable expected reward $r:\mathcal{S}\times\mathcal{A}\to\mathbb{R}$; and
+- a discount factor $\gamma\in[0,1)$.
+
+An RL problem additionally specifies an initial-state distribution $\mu_0$ and a policy. A
+stationary stochastic policy is a kernel $\pi(da\mid s)$ from states to actions. If rewards are
+random, $r$ can be replaced by a reward kernel, with $r(s,a)$ denoting its conditional mean.
+
+For finite spaces, $P(s'\mid s,a)$ is an action-dependent transition matrix and
+$\pi(a\mid s)$ is a probability vector, so
+$\sum_{s'}P(s'\mid s,a)=1$ and $\sum_a\pi(a\mid s)=1$.
+
+Let $\mathcal{H}_t=\sigma(S_0,A_0,\ldots,S_t,A_t)$ be the history available at time $t$. The
+controlled Markov property is
+
+$$
+\mathbb{P}(S_{t+1}\in B\mid\mathcal{H}_t)
+=P(B\mid S_t,A_t)
+\quad\text{a.s.}
+$$
+
+Together, $\mu_0$, $\pi$, and $P$ induce the trajectory law
+$\mathbb{P}_{\mu_0}^{\pi}$ through the iterated-kernel construction above. Let
+$\mathbb{P}_s^\pi$ denote the law obtained by taking the initial distribution to be the point mass
+$\delta_s$. The value function is then rigorously
+
+$$
+V^\pi(s)
+=\mathbb{E}_{\mathbb{P}_s^\pi}
+\!\left[\sum_{t=0}^{\infty}\gamma^t r(S_t,A_t)\right].
+$$
+
+Applying the tower property and conditioning on the first action and next state gives the Bellman
+expectation equation
+
+$$
+V^\pi(s)
+=\int_\mathcal{A}\pi(da\mid s)
+\left[
+r(s,a)+\gamma\int_\mathcal{S}P(ds'\mid s,a)V^\pi(s')
+\right].
+$$
+
+For finite state and action spaces, both integrals become sums:
+
+$$
+V^\pi(s)
+=\sum_{a\in\mathcal{A}}\pi(a\mid s)
+\left[
+r(s,a)+\gamma\sum_{s'\in\mathcal{S}}
+P(s'\mid s,a)V^\pi(s')
+\right].
+$$
+
+Thus the familiar RL notation is grounded in three measure-theoretic operations: kernels construct
+the trajectory law, conditional expectations express available information, and iterated
+expectations produce the Bellman recursion.

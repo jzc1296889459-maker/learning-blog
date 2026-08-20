@@ -1,0 +1,284 @@
+---
+title: '强化学习的基本概念'
+description: '状态、动作、奖励与贝尔曼方程。'
+date: 2026-08-20
+updatedDate: 2026-08-20
+tags:
+  - RL
+  - book-notes
+language: 'zh-CN'
+type: note
+status: in-progress
+draft: false
+---
+
+> **来源说明**
+> 这是我的强化学习笔记。理论部分主要参考 Shiyu Zhao 的
+> _Mathematical Foundations of Reinforcement Learning_，以及 Sutton 和 Barto 的
+> _Reinforcement Learning: An Introduction_。代码部分主要参考上海交通大学团队的
+> _动手学强化学习_。
+
+## 预备知识：测度论概率
+
+概率空间是一个三元组 $(\Omega, \mathcal{F}, \mathbb{P})$：
+
+- $\Omega$ 是所有可能结果组成的集合。
+- $\mathcal{F}$ 是由可测事件组成的 $\sigma$-代数，它对补集和可数并封闭。
+- $\mathbb{P}$ 是定义在这些事件上的概率测度。
+
+随机变量是一个可测映射 $X : \Omega \to \mathcal{X}$。它的分布（或称概率律）是推前测度
+
+$$
+\mu_X(A) = \mathbb{P}(X \in A), \qquad A \subseteq \mathcal{X}.
+$$
+
+对于可积函数 $f$，期望是关于概率测度的积分：
+
+$$
+\mathbb{E}[f(X)]
+= \int_\Omega f(X(\omega))\,\mathbb{P}(d\omega)
+= \int_\mathcal{X} f(x)\,\mu_X(dx).
+$$
+
+如果 $X$ 的支撑集有限或可数，同一个积分可以写成求和：
+
+$$
+\mathbb{E}[f(X)]
+=\sum_{x\in\mathcal{X}}f(x)\,\mathbb{P}(X=x).
+$$
+
+概率质量函数或密度 $p(x)$ 是概率测度相对于计数测度或勒贝格测度的一种表示；并非每个概率测度都存在密度。如果一个命题只在某个零概率集合上不成立，就称它**几乎必然**成立，简写为 a.s.
+
+### 转移核与路径空间上的测度
+
+设 $(\mathcal{X},\mathscr{X})$ 和 $(\mathcal{Y},\mathscr{Y})$ 是可测空间。从
+$\mathcal{X}$ 到 $\mathcal{Y}$ 的**随机核** $K$，会为每个 $x\in\mathcal{X}$ 指定一个定义在
+$\mathcal{Y}$ 上的概率分布 $K(x,\cdot)$，并满足两个条件：
+
+1. 对每个固定的 $x$，映射 $B\mapsto K(x,B)$ 是概率测度。
+2. 对每个固定的 $B\in\mathscr{Y}$，映射 $x\mapsto K(x,B)$ 是可测函数。
+
+我们常把它写作 $K(x,dy)$。马尔可夫转移核就是从当前状态空间到下一状态空间的随机核。
+
+在有限空间上，定义 $K(x,y)=K(x,\{y\})$，于是
+
+$$
+\sum_{y\in\mathcal{Y}}K(x,y)=1,
+\qquad
+\int_\mathcal{Y}g(y)K(x,dy)
+=\sum_{y\in\mathcal{Y}}g(y)K(x,y).
+$$
+
+一个初始分布和一列随机核可以确定无限乘积空间上的概率测度。更准确地说，设 $\mu_0$ 是
+$\mathcal{X}_0$ 上的分布，并令
+
+$$
+K_t(x_0,\ldots,x_t,dx_{t+1})
+$$
+
+表示在给定历史后选取下一个坐标的随机核。Ionescu–Tulcea 定理保证在
+$\Omega=\prod_{t=0}^{\infty}\mathcal{X}_t$ 上存在唯一的概率测度 $\mathbb{P}$，它在柱事件上的概率由迭代积分给出：
+
+$$
+\begin{aligned}
+&\mathbb{P}(X_0\in A_0,\ldots,X_n\in A_n) \\
+&\quad=
+\int_{A_0}\mu_0(dx_0)
+\int_{A_1}K_0(x_0,dx_1)\cdots
+\int_{A_n}K_{n-1}(x_0,\ldots,x_{n-1},dx_n).
+\end{aligned}
+$$
+
+对于齐次马尔可夫链，下一状态的随机核只依赖当前状态：
+$K_t(x_0,\ldots,x_t,dx_{t+1})=K(x_t,dx_{t+1})$。在有限状态空间上，上式化为
+
+$$
+\mathbb{P}(X_0=x_0,\ldots,X_n=x_n)
+=\mu_0(x_0)\prod_{t=0}^{n-1}K(x_t,x_{t+1}).
+$$
+
+在强化学习中，策略 $\pi(da\mid s)$ 和环境转移核 $P(ds'\mid s,a)$ 交替出现：
+
+$$
+\mu_0(ds_0)\,
+\pi(da_0\mid s_0)\,
+P(ds_1\mid s_0,a_0)\,
+\pi(da_1\mid s_1)\,
+P(ds_2\mid s_1,a_1)\cdots.
+$$
+
+因此，在有限状态和动作空间上，一段有限轨迹前缀的概率为
+
+$$
+\mathbb{P}_{\mu_0}^{\pi}
+(S_0=s_0,A_0=a_0,\ldots,A_{n-1}=a_{n-1},S_n=s_n)
+=\mu_0(s_0)\prod_{t=0}^{n-1}
+\pi(a_t\mid s_t)P(s_{t+1}\mid s_t,a_t).
+$$
+
+这些核的迭代积分在轨迹
+$\tau=(S_0,A_0,S_1,A_1,\ldots)$ 上定义了唯一的概率律
+$\mathbb{P}_{\mu_0}^{\pi}$。非正式写法 $\tau\sim p_\pi$ 或 $\mathbb{E}_\pi$ 所省略的正是这个对象。
+
+### 条件概率与条件期望
+
+设 $X$ 可积，并令 $\mathcal{G}\subseteq\mathcal{F}$ 表示当前可用的信息。如果
+$Z=\mathbb{E}[X\mid\mathcal{G}]$ 是 $\mathcal{G}$-可测随机变量，并且满足
+
+$$
+\int_G Z\,d\mathbb{P}=\int_G X\,d\mathbb{P}
+\qquad\text{对每个 }G\in\mathcal{G},
+$$
+
+那么 $Z$ 就是 $X$ 关于 $\mathcal{G}$ 的条件期望。它在几乎必然相等的意义下唯一。在强化学习中常见的标准 Borel 空间上，还可以使用正则条件分布 $K_{X\mid Y}(y,dx)$。对于合适的 $g$，
+
+$$
+\mathbb{E}[g(X)\mid Y]
+=\int_\mathcal{X}g(x)K_{X\mid Y}(Y,dx).
+$$
+
+当 $X$ 是离散随机变量时，它变成常见的条件求和：
+
+$$
+\mathbb{E}[g(X)\mid Y=y]
+=\sum_{x\in\mathcal{X}}g(x)\mathbb{P}(X=x\mid Y=y).
+$$
+
+最常用的规则包括：
+
+- **线性性：**
+  $\mathbb{E}[aX+bY\mid\mathcal{G}]
+  =a\mathbb{E}[X\mid\mathcal{G}]+b\mathbb{E}[Y\mid\mathcal{G}]$。
+- **提出已知量：**如果 $Y$ 是 $\mathcal{G}$-可测的，那么只要各项可积，
+  $\mathbb{E}[YX\mid\mathcal{G}]=Y\mathbb{E}[X\mid\mathcal{G}]$。
+- **塔式法则：**如果 $\mathcal{H}\subseteq\mathcal{G}$，那么
+  $\mathbb{E}[\mathbb{E}[X\mid\mathcal{G}]\mid\mathcal{H}]
+  =\mathbb{E}[X\mid\mathcal{H}]$。
+- **全期望公式：**
+  $\mathbb{E}[\mathbb{E}[X\mid\mathcal{G}]]=\mathbb{E}[X]$。
+- **独立性：**如果 $X$ 与 $\mathcal{G}$ 独立，那么
+  $\mathbb{E}[X\mid\mathcal{G}]=\mathbb{E}[X]$ a.s.
+
+#### 全概率公式与全期望公式
+
+对于满足 $\mathbb{P}(B_i)>0$ 的可数划分 $(B_i)_i$，
+
+$$
+\mathbb{P}(A)=\sum_i\mathbb{P}(A\mid B_i)\mathbb{P}(B_i),
+\qquad
+\mathbb{E}[X]=\sum_i\mathbb{E}[X\mid B_i]\mathbb{P}(B_i).
+$$
+
+等价地，如果 $Y$ 是离散随机变量，
+
+$$
+\begin{aligned}
+\mathbb{P}(X\in A)
+  &=\sum_y\mathbb{P}(X\in A\mid Y=y)\mathbb{P}(Y=y),\\
+\mathbb{E}[g(X)]
+  &=\sum_y\mathbb{E}[g(X)\mid Y=y]\mathbb{P}(Y=y).
+\end{aligned}
+$$
+
+对于一般的条件变量，求和变为关于其概率律 $\mu_Y$ 的积分：
+
+$$
+\begin{aligned}
+\mathbb{P}(X\in A)
+  &=\int K_{X\mid Y}(y,A)\,\mu_Y(dy),\\
+\mathbb{E}[g(X)]
+  &=\int \mathbb{E}[g(X)\mid Y=y]\,\mu_Y(dy).
+\end{aligned}
+$$
+
+如果 $Y$ 具有密度 $f_Y$，那么 $\mu_Y(dy)=f_Y(y)dy$。如果条件密度也存在，连续形式的全概率公式通常写作
+
+$$
+f_X(x)=\int f_{X\mid Y}(x\mid y)f_Y(y)\,dy.
+$$
+
+### 概率论记号与 ML/RL 记号的对照
+
+ML 和 RL 的记号通常强调样本是如何生成的。它只是对相应概率测度下积分的简写，并不是另一种期望定义。
+
+| 概率论语言                                       | ML/RL 中的常见记号                                                  | 含义                                                   |
+| ------------------------------------------------ | ------------------------------------------------------------------- | ------------------------------------------------------ |
+| $\int f(x)\,\mu(dx)$                             | $\mathbb{E}_{x\sim p}[f(x)]$                                        | 关于非正式记作 $p$ 的概率律对 $f$ 积分。               |
+| 策略核 $\pi(s,da)$                               | $a\sim\pi(\cdot\mid s)$                                             | 从状态 $s$ 所对应的动作分布中采样。                    |
+| $\mathbb{E}_{\mathbb{P}_{\mu_0}^{\pi}}[F(\tau)]$ | $\mathbb{E}_\pi[F(\tau)]$ 或 $\mathbb{E}_{\tau\sim p_\pi}[F(\tau)]$ | 对上文构造的轨迹概率律积分；环境和初始分布通常被省略。 |
+| $\int f(s,a)d^\pi(ds)\pi(da\mid s)$              | $\mathbb{E}_{s\sim d^\pi,\,a\sim\pi(\cdot\mid s)}[f(s,a)]$          | 先按状态占用概率律积分，再按策略积分。                 |
+| $\mathbb{E}[f(X)]$                               | $\frac{1}{N}\sum_{i=1}^N f(x_i)$                                    | 用蒙特卡洛样本平均近似期望。                           |
+
+对于有限的 $\mathcal{S}$ 和 $\mathcal{A}$，状态占用测度对应的公式变成
+
+$$
+\mathbb{E}_{s\sim d^\pi,\,a\sim\pi(\cdot\mid s)}[f(s,a)]
+=\sum_{s\in\mathcal{S}}d^\pi(s)
+\sum_{a\in\mathcal{A}}\pi(a\mid s)f(s,a).
+$$
+
+例如，策略的价值可以简写为
+
+$$
+V^\pi(s)
+= \mathbb{E}_\pi\!\left[\sum_{t=0}^{\infty}\gamma^t R_t
+  \;\middle|\; S_0=s\right].
+$$
+
+因此，下标 $\pi$ 并不表示策略是唯一的随机对象。它指代依赖策略的轨迹概率律，同时省略了初始分布、转移核，以及可能存在的奖励核。
+
+### MDP 的严格定义
+
+有了这些工具，就可以定义无限时域折扣马尔可夫决策过程。一个 MDP 包含：
+
+- 可测状态空间 $(\mathcal{S},\mathscr{S})$；
+- 可测动作空间 $(\mathcal{A},\mathscr{A})$；
+- 从 $\mathcal{S}\times\mathcal{A}$ 到 $\mathcal{S}$ 的转移核 $P(ds'\mid s,a)$；
+- 可测的期望奖励函数 $r:\mathcal{S}\times\mathcal{A}\to\mathbb{R}$；
+- 折扣因子 $\gamma\in[0,1)$。
+
+一个强化学习问题还需要给定初始状态分布 $\mu_0$ 和策略。平稳随机策略是一个从状态到动作的随机核 $\pi(da\mid s)$。如果奖励是随机的，可以用奖励核替代 $r$，此时 $r(s,a)$ 表示奖励的条件均值。
+
+对于有限空间，$P(s'\mid s,a)$ 是由动作决定的转移矩阵，$\pi(a\mid s)$ 是概率向量，因此
+$\sum_{s'}P(s'\mid s,a)=1$ 且 $\sum_a\pi(a\mid s)=1$。
+
+令 $\mathcal{H}_t=\sigma(S_0,A_0,\ldots,S_t,A_t)$ 表示时刻 $t$ 已知的历史信息。受控马尔可夫性质为
+
+$$
+\mathbb{P}(S_{t+1}\in B\mid\mathcal{H}_t)
+=P(B\mid S_t,A_t)
+\quad\text{a.s.}
+$$
+
+$\mu_0$、$\pi$ 和 $P$ 通过上面的迭代随机核构造共同诱导轨迹概率律
+$\mathbb{P}_{\mu_0}^{\pi}$。令 $\mathbb{P}_s^\pi$ 表示把初始分布取为点质量
+$\delta_s$ 时得到的概率律，则价值函数可以严格定义为
+
+$$
+V^\pi(s)
+=\mathbb{E}_{\mathbb{P}_s^\pi}
+\!\left[\sum_{t=0}^{\infty}\gamma^t r(S_t,A_t)\right].
+$$
+
+应用塔式法则，并对第一个动作和下一个状态作条件化，可以得到贝尔曼期望方程
+
+$$
+V^\pi(s)
+=\int_\mathcal{A}\pi(da\mid s)
+\left[
+r(s,a)+\gamma\int_\mathcal{S}P(ds'\mid s,a)V^\pi(s')
+\right].
+$$
+
+对于有限状态和动作空间，两个积分都变成求和：
+
+$$
+V^\pi(s)
+=\sum_{a\in\mathcal{A}}\pi(a\mid s)
+\left[
+r(s,a)+\gamma\sum_{s'\in\mathcal{S}}
+P(s'\mid s,a)V^\pi(s')
+\right].
+$$
+
+因此，熟悉的强化学习记号建立在三种测度论操作之上：随机核构造轨迹概率律，条件期望表达当前可用的信息，而迭代期望产生贝尔曼递推。
