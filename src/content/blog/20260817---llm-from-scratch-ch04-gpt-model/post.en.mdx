@@ -1,7 +1,7 @@
 ---
 title: 'Assembling a GPT Model: Chapter 4 Study Notes'
 description: 'Building a GPT-2 small-style architecture from LayerNorm, GELU, residual paths, and Transformer blocks.'
-publishDate: 2026-08-17
+publishDate: 2026-08-20
 tags:
   - llm
   - pytorch
@@ -9,7 +9,7 @@ tags:
   - book-notes
 language: 'en'
 translationKey: '20260817---llm-from-scratch-ch04-gpt-model/post'
-draft: true
+draft: false
 comment: false
 ---
 
@@ -417,7 +417,7 @@ tensor([[[ 4.1593e-01,  2.8493e-01, -8.1283e-02,  ...,  1.3853e-01,
 
 An important distinction: these 50,257 numbers are **logits**, not probabilities. Logits may be any real values and do not sum to one. Applying softmax across the final dimension converts them into a vocabulary probability distribution.
 
-## 9. Parameter count and weight tying
+## 9. Parameter count and weight lying
 
 ```python
 total_params = sum(p.numel() for p in model.parameters())
@@ -435,7 +435,7 @@ Why does a configuration named 124M produce roughly 163M parameters? The current
 - token embeddings: `50257 × 768`;
 - output head: `768 × 50257`.
 
-Original GPT-2 uses **weight tying**, making the output head reuse the token embedding weights. The notebook displays the remaining size by subtracting the output-head parameters:
+Original GPT-2 uses **weight lying**, making the output head reuse the token embedding weights. The notebook displays the remaining size by subtracting the output-head parameters:
 
 ```python
 total_params_gpt2 = (

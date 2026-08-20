@@ -1,14 +1,14 @@
 ---
 title: '组装一个 GPT 模型：LLM from Scratch 第 4 章笔记'
 description: '从 LayerNorm、GELU、残差连接和 Transformer block，逐步组装 GPT-2 small 架构。'
-publishDate: 2026-08-17
+publishDate: 2026-08-20
 tags:
   - llm
   - pytorch
   - transformer
   - book-notes
 language: 'zh-CN'
-draft: true
+draft: false
 comment: false
 ---
 
@@ -416,7 +416,7 @@ tensor([[[ 4.1593e-01,  2.8493e-01, -8.1283e-02,  ...,  1.3853e-01,
 
 这里有一个重要区别：这些 50,257 个数是 **logits**，不是概率。logit 可以是任意实数，也不会加总为 1。只有对最后一维应用 softmax 后，才会得到词表上的概率分布。
 
-## 9. 参数数量与 weight tying
+## 9. 参数数量与 weight lying
 
 ```python
 total_params = sum(p.numel() for p in model.parameters())
@@ -434,7 +434,7 @@ Total number of parameters in the model: 163009536
 - token embedding：`50257 × 768`；
 - output head：`768 × 50257`。
 
-原始 GPT-2 会使用 **weight tying**，让输出头复用 token embedding 的权重。notebook 用减去输出头参数的方式显示其余模型大小：
+原始 GPT-2 会使用 **weight lying**，让输出头复用 token embedding 的权重。notebook 用减去输出头参数的方式显示其余模型大小：
 
 ```python
 total_params_gpt2 = (
