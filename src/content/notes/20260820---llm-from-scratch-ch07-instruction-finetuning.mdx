@@ -1,0 +1,632 @@
+---
+title: '微调 GPT 遵循指令：LLM from Scratch 第 7 章笔记'
+description: '格式化 instruction data、屏蔽 padding targets、微调 GPT-2 medium，并用本地 LLM judge 评估回答。'
+date: 2026-08-20
+tags:
+  - llm
+  - pytorch
+  - fine-tuning
+  - instruction-tuning
+  - book-notes
+language: 'zh-CN'
+type: note
+status: in-progress
+draft: false
+---
+
+> **来源说明**
+>
+> 本文是我跟随 Sebastian Raschka 的 [_Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch) 第 7 章 “Fine-tuning to Follow Instructions” 所做的学习笔记。代码来自该书及其[官方 Chapter 7 配套代码](https://github.com/rasbt/LLMs-from-scratch/tree/main/ch07/01_main-chapter-code)，版权归原作者所有，并按官方仓库的 Apache 2.0 许可证发布。初稿由 Codex 参考我学习时写的 Jupyter Notebook 生成。本文不会代替原书，而是记录我对 instruction formatting、target masking、fine-tuning 与 response evaluation 的理解。
+
+第 6 章把 pretrained GPT 改成了 classifier。第 7 章保留 language-model output head，转而教模型一种新的文本生成模式：读取 instruction，并给出合适的 response。
+
+```text
+instruction + optional input + desired response
+  → 一个格式化的 training sequence
+  → tokenize 并对 batch 动态 padding
+  → shifted next-token targets
+  → 在 loss 中忽略重复 padding
+  → fine-tune pretrained GPT-2
+  → 为未见 instructions 生成 responses
+  → 人工检查并用 LLM judge 评分
+```
+
+底层任务仍然是 next-token prediction，真正改变的是训练文本的结构与用途。
+
+## 1. Instruction dataset
+
+Notebook 下载了一份包含 1,100 个 instruction examples 的 JSON：
+
+```python
+import json
+import os
+import urllib.request
+
+def download_and_load_file(file_path, url):
+    if not os.path.exists(file_path):
+        with urllib.request.urlopen(url) as response:
+            text_data = response.read().decode("utf-8")
+        with open(file_path, "w", encoding="utf-8") as file:
+            file.write(text_data)
+
+    with open(file_path, "r", encoding="utf-8") as file:
+        return json.load(file)
+
+file_path = "instruction-data.json"
+url = (
+    "https://raw.githubusercontent.com/rasbt/"
+    "LLMs-from-scratch/main/ch07/01_main-chapter-code/"
+    "instruction-data.json"
+)
+data = download_and_load_file(file_path, url)
+```
+
+每条数据包含三个字段：
+
+```python
+{
+    "instruction": "Identify the correct spelling of the following word.",
+    "input": "Ocassion",
+    "output": "The correct spelling is 'Occasion.'",
+}
+```
+
+| 字段          | 作用                 |
+| ------------- | -------------------- |
+| `instruction` | 描述需要完成的任务   |
+| `input`       | 提供可选的任务上下文 |
+| `output`      | 给出期望回答         |
+
+因为 `output` 是明确的目标回答，所以这是一份 supervised dataset。
+
+## 2. 格式化 prompt template
+
+模型不会天然理解 JSON key 的含义。代码把这些字段转换为固定文本模板：
+
+```python
+def format_input(entry):
+    instruction_text = (
+        "Below is an instruction that describes a task. "
+        "Write a response that appropriately completes the request."
+        f"\n\n### Instruction:\n{entry['instruction']}"
+    )
+
+    input_text = (
+        f"\n\n### Input:\n{entry['input']}"
+        if entry["input"]
+        else ""
+    )
+
+    return instruction_text + input_text
+```
+
+Desired response 被单独附加：
+
+```python
+model_input = format_input(entry)
+desired_response = f"\n\n### Response:\n{entry['output']}"
+full_text = model_input + desired_response
+```
+
+完整训练样本为：
+
+```text
+Below is an instruction that describes a task.
+Write a response that appropriately completes the request.
+
+### Instruction:
+Identify the correct spelling of the following word.
+
+### Input:
+Ocassion
+
+### Response:
+The correct spelling is 'Occasion.'
+```
+
+当 `input` 为空时，`Input` 区块会被省略。固定 heading 让模型学会任务在哪里结束、回答从哪里开始。
+
+Inference 时只提供 `format_input(entry)`，模型要根据训练中学到的模式继续生成 response section。
+
+## 3. 切分数据
+
+Notebook 使用 85% 训练、10% 测试，其余部分验证：
+
+```python
+train_portion = int(len(data) * 0.85)
+test_portion = int(len(data) * 0.10)
+
+train_data = data[:train_portion]
+test_data = data[
+    train_portion : train_portion + test_portion
+]
+val_data = data[train_portion + test_portion :]
+```
+
+1,100 条数据被切分为：
+
+| 数据集     | 数量 | 用途                  |
+| ---------- | ---: | --------------------- |
+| Training   |  935 | 更新模型参数          |
+| Validation |   55 | 监控 fine-tuning      |
+| Test       |  110 | 评估未见 instructions |
+
+固定 slicing 让切分可以复现，但它假设源数据顺序适合直接切分。如果 examples 按 task type 聚集，就应先 shuffle 再切分。
+
+## 4. Tokenize 完整的 instruction–response sequence
+
+`InstructionDataset` 会预先格式化并 tokenize 每一条完整样本：
+
+```python
+import tiktoken
+from torch.utils.data import Dataset
+
+tokenizer = tiktoken.get_encoding("gpt2")
+
+class InstructionDataset(Dataset):
+    def __init__(self, data, tokenizer):
+        self.data = data
+        self.encoded_texts = []
+
+        for entry in data:
+            instruction_plus_input = format_input(entry)
+            response_text = (
+                f"\n\n### Response:\n{entry['output']}"
+            )
+            full_text = instruction_plus_input + response_text
+            self.encoded_texts.append(
+                tokenizer.encode(full_text)
+            )
+
+    def __getitem__(self, index):
+        return self.encoded_texts[index]
+
+    def __len__(self):
+        return len(self.data)
+```
+
+与第 6 章不同，`__getitem__` 不返回单独的 class label。Answer 已经在 token sequence 中，之后通过错开序列构造 inputs 与 targets。
+
+## 5. 为什么需要 custom collate function
+
+Instruction examples 长度不同。与其把整个 dataset 全部 pad 到一个全局最大值，collate function 只把当前 batch pad 到其中最长 item。
+
+GPT-2 的 end-of-text token 同时作为 padding token：
+
+```python
+tokenizer.encode(
+    "<|endoftext|>",
+    allowed_special={"<|endoftext|>"},
+)
+# [50256]
+```
+
+对每个 item，collate function 会：
+
+1. 添加一个 end-of-text token。
+2. Pad 到当前 batch 的最大长度。
+3. 去掉最后一个 token，构造 inputs。
+4. 去掉第一个 token，构造 targets。
+
+```text
+padded:  [0, 1, 2, 3, 4, EOT]
+inputs:  [0, 1, 2, 3, 4]
+targets: [1, 2, 3, 4, EOT]
+```
+
+EOT 没有出现在 input 的最后一个位置，却保留为最后一个有效 target。模型由此学习在回答结束时生成 EOT。
+
+## 6. 忽略重复的 padding targets
+
+如果每个 padding token 都参与 cross-entropy，短样本的大部分 loss 都会用于反复预测 EOT。最终的 collate function 保留第一个 EOT target，把之后的 padding targets 改为 `-100`：
+
+```python
+import torch
+
+def custom_collate_fn(
+    batch,
+    pad_token_id=50256,
+    ignore_index=-100,
+    allowed_max_length=None,
+    device="cpu",
+):
+    batch_max_length = max(len(item) + 1 for item in batch)
+    inputs_list = []
+    targets_list = []
+
+    for item in batch:
+        new_item = item.copy()
+        new_item += [pad_token_id]
+
+        padded = new_item + [pad_token_id] * (
+            batch_max_length - len(new_item)
+        )
+
+        inputs = torch.tensor(padded[:-1])
+        targets = torch.tensor(padded[1:])
+
+        mask = targets == pad_token_id
+        indices = torch.nonzero(mask).flatten()
+        if indices.numel() > 1:
+            targets[indices[1:]] = ignore_index
+
+        if allowed_max_length is not None:
+            inputs = inputs[:allowed_max_length]
+            targets = targets[:allowed_max_length]
+
+        inputs_list.append(inputs)
+        targets_list.append(targets)
+
+    inputs_tensor = torch.stack(inputs_list).to(device)
+    targets_tensor = torch.stack(targets_list).to(device)
+    return inputs_tensor, targets_tensor
+```
+
+PyTorch cross-entropy 默认使用 `ignore_index=-100`。这些位置不参与平均 loss，也不会产生 gradient：
+
+```python
+loss = torch.nn.functional.cross_entropy(
+    logits.flatten(0, 1),
+    targets.flatten(),
+)
+```
+
+第一个 EOT 仍然是 target 50,256，所以模型会学习停止；只有额外添加的 EOT padding 被忽略。
+
+按照当前实现，instruction、optional input、response heading 与 response tokens 都参与 loss。Mask 只排除 padding，并没有把训练范围限制为 response tokens。
+
+## 7. 用 partial 绑定 batch 设置
+
+DataLoader 需要一个只接收 batch 的 callable。`functools.partial` 可以预先绑定 device 和最大长度：
+
+```python
+from functools import partial
+
+device = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+customized_collate_fn = partial(
+    custom_collate_fn,
+    device=device,
+    allowed_max_length=1024,
+)
+```
+
+它相当于编写一个小 wrapper function，但不需要再次定义函数。截断到 1,024 可以保证序列不超出 GPT-2 positional embedding 的范围。
+
+## 8. 创建 DataLoaders
+
+```python
+from torch.utils.data import DataLoader
+
+torch.manual_seed(123)
+
+train_loader = DataLoader(
+    InstructionDataset(train_data, tokenizer),
+    batch_size=8,
+    collate_fn=customized_collate_fn,
+    shuffle=True,
+    drop_last=True,
+    num_workers=0,
+)
+
+val_loader = DataLoader(
+    InstructionDataset(val_data, tokenizer),
+    batch_size=8,
+    collate_fn=customized_collate_fn,
+    shuffle=False,
+    drop_last=False,
+    num_workers=0,
+)
+
+test_loader = DataLoader(
+    InstructionDataset(test_data, tokenizer),
+    batch_size=8,
+    collate_fn=customized_collate_fn,
+    shuffle=False,
+    drop_last=False,
+    num_workers=0,
+)
+```
+
+Padding 是逐 batch 动态完成的，因此不同 batch 的 sequence length 可以不同；但在同一个 batch 内，inputs 与 targets 都是 shape 相同的 rectangular tensors。
+
+## 9. 加载 GPT-2 medium
+
+Notebook 选择 GPT-2 medium，而不是前几章演示中的 small model：
+
+```python
+from GPTmodel import GPTModel, load_weights_into_gpt
+from gpt_download import download_and_load_gpt2
+
+base_config = {
+    "vocab_size": 50257,
+    "context_length": 1024,
+    "drop_rate": 0.0,
+    "qkv_bias": True,
+}
+
+model_configs = {
+    "gpt2-small (124M)": {
+        "emb_dim": 768,
+        "n_layers": 12,
+        "n_heads": 12,
+    },
+    "gpt2-medium (355M)": {
+        "emb_dim": 1024,
+        "n_layers": 24,
+        "n_heads": 16,
+    },
+}
+
+choose_model = "gpt2-medium (355M)"
+base_config.update(model_configs[choose_model])
+
+model_size = (
+    choose_model.split(" ")[-1]
+    .lstrip("(")
+    .rstrip(")")
+)
+settings, params = download_and_load_gpt2(
+    model_size=model_size,
+    models_dir="gpt2",
+)
+
+model = GPTModel(base_config)
+load_weights_into_gpt(model, params)
+```
+
+GPT-2 medium 的 embedding dimension 为 1,024，共有 24 个 Transformer blocks 和 16 个 attention heads。
+
+与第 6 章 classification 不同，这里不替换 output head。回答仍然需要逐 token 生成 vocabulary logits。
+
+## 10. 建立 pretrained baseline
+
+Fine-tuning 之前，Notebook 要求 pretrained model 把 active sentence 改为 passive voice。模型基本只是重复原句，又开始生成另一条 instruction，没有稳定遵循转换要求。
+
+这个 baseline 很重要：GPT-2 已经具备语言能力，但普通预训练并没有明确教它遵循当前 prompt template，或在指定位置完成 instruction。
+
+代码通过移除 prompt prefix 来提取回答：
+
+```python
+input_text = format_input(val_data[0])
+generated_text = token_ids_to_text(token_ids, tokenizer)
+response_text = generated_text[len(input_text) :].strip()
+```
+
+String slicing 依赖 `generated_text` 以完全相同的 decoded prompt 开头。生产代码应验证此前提，并更谨慎地解析 delimiter。
+
+## 11. Instruction fine-tuning
+
+第 5 章的训练循环可以直接复用，因为两个任务都在优化 next-token cross-entropy：
+
+```python
+model.to(device)
+torch.manual_seed(123)
+
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=0.00005,
+    weight_decay=0.1,
+)
+
+train_losses, val_losses, tokens_seen = train_model_simple(
+    model,
+    train_loader,
+    val_loader,
+    optimizer,
+    device,
+    num_epochs=2,
+    eval_freq=5,
+    eval_iter=5,
+    start_context=format_input(val_data[0]),
+    tokenizer=tokenizer,
+)
+```
+
+Notebook 中所有模型参数都保持 trainable。较小的 learning rate 可以避免 pretrained weights 发生过于剧烈的变化。
+
+最初抽样得到的 training 与 validation loss 都接近 2.64，之后在第一个 epoch 中迅速下降。与此同时，生成结果从重复原句变为一个有效的被动句：
+
+> The meal is prepared every day by the chef.
+
+这说明模型同时学到了 response format，以及 dataset 中所体现的 task-following behavior。
+
+## 12. 为 held-out examples 生成回答
+
+Notebook 先人工检查几个 test examples：
+
+```python
+for entry in test_data[:3]:
+    input_text = format_input(entry)
+    token_ids = generate(
+        model=model,
+        idx=text_to_token_ids(
+            input_text,
+            tokenizer,
+        ).to(device),
+        max_new_tokens=256,
+        context_size=base_config["context_length"],
+        eos_id=50256,
+    )
+
+    generated_text = token_ids_to_text(
+        token_ids,
+        tokenizer,
+    )
+    response_text = (
+        generated_text[len(input_text) :]
+        .replace("### Response:", "")
+        .strip()
+    )
+```
+
+其中一条 reference 是 “as fast as lightning”，模型回答 “as fast as a bullet”。文字不同，但两者都满足使用 simile 的要求。这说明 exact string matching 不适合评估 open-ended generation。
+
+另一条回答把 cumulonimbus 混淆为 cumulus，也说明语言形式流畅并不保证事实正确。
+
+## 13. 保存 responses 与模型
+
+完整 test set 被添加 `model_response` 字段并保存为 JSON：
+
+```python
+for i, entry in enumerate(test_data):
+    # Generate response_text...
+    test_data[i]["model_response"] = response_text
+
+with open(
+    "instruction-data-with-response.json",
+    "w",
+    encoding="utf-8",
+) as file:
+    json.dump(
+        test_data,
+        file,
+        indent=4,
+        ensure_ascii=False,
+    )
+```
+
+模型 checkpoint 名称从选择的模型名称生成：
+
+```python
+import re
+
+file_name = (
+    f"{re.sub(r'[ ()]', '', choose_model)}-sft.pth"
+)
+torch.save(model.state_dict(), file_name)
+# gpt2-medium355M-sft.pth
+```
+
+Regular expression 会移除空格和括号。与前几章一样，恢复 checkpoint 还需要完全匹配的 model configuration 与 preprocessing/template conventions。
+
+## 14. 为什么 response evaluation 很困难
+
+Classification 只有很小的固定 label set，而 instruction response 可以用许多不同方式正确回答。评估方式可能包括：
+
+- 对只有一个确定答案的任务做 exact 或 normalized matching；
+- 使用 task-specific tests，例如直接执行生成的代码；
+- 由人类检查 correctness、relevance、clarity 与 safety；
+- 使用 model-based scoring 快速完成近似评估。
+
+没有一个单独 metric 能覆盖所有 instruction-following behavior。
+
+## 15. 使用本地 LLM 作为 judge
+
+Notebook 通过 Ollama HTTP API 查询本地 Llama 3：
+
+```python
+def query_model(
+    prompt,
+    model="llama3",
+    url="http://localhost:11434/api/chat",
+):
+    data = {
+        "model": model,
+        "messages": [
+            {"role": "user", "content": prompt},
+        ],
+        "options": {
+            "seed": 123,
+            "temperature": 0,
+            "num_ctx": 2048,
+        },
+    }
+
+    payload = json.dumps(data).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+
+    response_text = ""
+    with urllib.request.urlopen(request) as response:
+        for line in response:
+            response_json = json.loads(line.decode("utf-8"))
+            response_text += response_json["message"]["content"]
+
+    return response_text
+```
+
+Temperature 0 与固定 seed 有助于提高 reproducibility。Endpoint 会 stream JSON lines，因此函数逐行拼接 `message.content`。
+
+每条 test entry 都被转换为 grading prompt：
+
+```python
+def generate_model_scores(
+    json_data,
+    json_key,
+    model="llama3",
+):
+    scores = []
+
+    for entry in json_data:
+        prompt = (
+            f"Given the input {format_input(entry)!r} "
+            f"and correct output {entry['output']!r}, "
+            f"score the model response {entry[json_key]!r} "
+            "on a scale from 0 to 100, where 100 is best. "
+            "Respond with the integer number only."
+        )
+
+        score = query_model(prompt, model)
+        try:
+            scores.append(int(score))
+        except ValueError:
+            print(f"Could not convert score: {score}")
+
+    return scores
+```
+
+Notebook 成功得到 110 个 scores，平均分为 47.65。
+
+这个数字可以用于比较采用相同 judge 和 rubric 的实验，但它不是客观质量指标。LLM judge 会受到措辞、答案长度、排列顺序、被评估文本中的 prompt injection，以及自身事实错误的影响。更可靠的评估应使用详细 rubric、验证 score parsing、观察 score distribution，并保留人工抽查。
+
+## 16. 第 7 章与前两章的区别
+
+| 方面           | Pretraining         | Classification fine-tuning | Instruction fine-tuning         |
+| -------------- | ------------------- | -------------------------- | ------------------------------- |
+| Input          | 普通文本            | 一条 SMS message           | instruction + optional input    |
+| Target         | next token          | 一个 class label           | desired response tokens         |
+| Output head    | vocabulary          | 两个 classes               | vocabulary                      |
+| Loss positions | 文本 tokens         | 序列最后位置               | 非 padding sequence tokens      |
+| 结果           | base language model | spam classifier            | instruction-following generator |
+| 评估           | loss 与 samples     | accuracy                   | response quality                |
+
+Instruction tuning 并没有替换 next-token prediction，而是通过安排 supervised examples，让 next-token prediction 学会一种交互行为。
+
+## 17. 最终理解
+
+我在这一章得到的主要认识是：
+
+1. Prompt template 把结构化 instruction records 转换为统一的 language-model sequence。
+2. Inputs 与 targets 仍然通过把同一 token sequence 错开一个位置得到。
+3. Dynamic batch padding 比 pad 到整个 dataset maximum 更节省计算。
+4. 一个 EOT target 教模型停止，`-100` 则让重复 padding 不参与 cross-entropy。
+5. Pretrained GPT-2 已能生成语言，但在 fine-tuning 前不能稳定遵循新的 instruction format。
+6. Instruction tuning 可以复用 pretraining 的 model architecture、vocabulary head 与 training loop。
+7. Open-ended answers 需要 semantic evaluation，不能只比较字符串是否完全相同。
+8. LLM-as-judge 具有扩展性，但只是近似评估，因此必须记录 rubric、模型、设置与局限。
+
+从第 2 章到第 7 章，现在形成了一条完整路径：
+
+```text
+text → tokens → attention → GPT
+  → pretraining → pretrained weights
+  → classification fine-tuning
+  → instruction fine-tuning
+  → response evaluation
+```
+
+## 参考资料
+
+- [Build a Large Language Model (From Scratch)](https://www.manning.com/books/build-a-large-language-model-from-scratch)
+- [官方 LLMs-from-scratch GitHub 仓库](https://github.com/rasbt/LLMs-from-scratch)
+- [官方 Chapter 7 notebook](https://github.com/rasbt/LLMs-from-scratch/blob/main/ch07/01_main-chapter-code/ch07.ipynb)
+- [PyTorch DataLoader 文档](https://pytorch.org/docs/stable/data.html)
+- [PyTorch cross-entropy 文档](https://pytorch.org/docs/stable/generated/torch.nn.functional.cross_entropy.html)
+- [Ollama API 文档](https://github.com/ollama/ollama/blob/main/docs/api.md)
