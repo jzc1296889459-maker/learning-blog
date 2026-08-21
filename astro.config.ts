@@ -11,10 +11,10 @@ import rehypeKatex from 'rehype-katex'
 import remarkCjkFriendly from 'remark-cjk-friendly'
 import remarkMath from 'remark-math'
 
-
 // Local integrations
 // Local rehype & remark plugins
 import rehypeAutolinkHeadings from './src/plugins/rehype-auto-link-headings.ts'
+import remarkObsidian from './src/plugins/remark-obsidian.ts'
 import remarkReadingTime from './src/plugins/remark-reading-time.ts'
 // Shiki
 import {
@@ -26,6 +26,7 @@ import {
   updateStyle
 } from './src/plugins/shiki-transformers.ts'
 import config from './src/site.config.ts'
+
 const vercelProductionDomain = process.env.VERCEL_PROJECT_PRODUCTION_URL
 const siteUrl = vercelProductionDomain
   ? `https://${vercelProductionDomain}`
@@ -118,7 +119,7 @@ export default defineConfig({
   // Markdown Options
   markdown: {
     // remark-cjk-friendly：修复 **加粗** 紧贴全角标点时不渲染的 CommonMark flanking 问题
-    remarkPlugins: [remarkMath, remarkCjkFriendly],
+    remarkPlugins: [remarkMath, remarkCjkFriendly, remarkObsidian],
     rehypePlugins: [
       [rehypeKatex, {}],
       rehypeHeadingIds,
