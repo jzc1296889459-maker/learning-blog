@@ -1,0 +1,687 @@
+---
+title: '微调 GPT 完成文本分类：LLM from Scratch 第 6 章笔记'
+description: '通过数据平衡、新 output head 和选择性微调，把 pretrained GPT-2 改造成短信垃圾分类器。'
+date: 2026-08-20
+tags:
+  - llm
+  - pytorch
+  - fine-tuning
+  - classification
+  - book-notes
+language: 'zh-CN'
+type: note
+status: in-progress
+draft: false
+---
+
+> **来源说明**
+>
+> 本文是我跟随 Sebastian Raschka 的 [_Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch) 第 6 章 “Fine-tuning for Classification” 所做的学习笔记。代码来自该书及其[官方 Chapter 6 配套代码](https://github.com/rasbt/LLMs-from-scratch/tree/main/ch06/01_main-chapter-code)，版权归原作者所有，并按官方仓库的 Apache 2.0 许可证发布。初稿由 Codex 参考我学习时写的 Jupyter Notebook 生成。本文不会代替原书，而是记录我对模型如何从 next-token prediction 转向文本分类的理解。
+
+第 5 章加载了通过 next-token prediction 学到的 GPT-2 权重。第 6 章复用这些语言知识，完成一个不同的任务：判断一条 SMS message 是否为垃圾短信。
+
+```text
+原始 SMS messages
+  → 平衡 labels 并切分数据集
+  → tokenize、truncate、pad
+  → pretrained GPT-2
+  → 最后一个位置的 representation
+  → 二分类 output head
+  → cross-entropy 与选择性 fine-tuning
+  → spam / not spam
+```
+
+这是 supervised fine-tuning。与预训练不同，现在每条消息都有一个明确的 class label。
+
+## 1. 下载 SMS Spam Collection
+
+Notebook 从 UCI Machine Learning Repository 下载 SMS Spam Collection：
+
+```python
+import os
+import urllib.request
+import zipfile
+from pathlib import Path
+
+url = (
+    "https://archive.ics.uci.edu/static/public/228/"
+    "sms+spam+collection.zip"
+)
+zip_path = "sms_spam_collection.zip"
+extracted_path = "sms_spam_collection"
+data_file_path = (
+    Path(extracted_path) / "SMSSpamCollection.tsv"
+)
+
+def download_and_unzip_spam_data(
+    url,
+    zip_path,
+    extracted_path,
+    data_file_path,
+):
+    if data_file_path.exists():
+        print("Dataset already exists. Skipping download.")
+        return
+
+    with urllib.request.urlopen(url) as response:
+        with open(zip_path, "wb") as out_file:
+            out_file.write(response.read())
+
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        zip_ref.extractall(extracted_path)
+
+    original_path = Path(extracted_path) / "SMSSpamCollection"
+    os.rename(original_path, data_file_path)
+```
+
+文件存在性检查让这段操作可以安全重复执行：重新运行 Notebook 时，不会再次下载和解压已有文件。
+
+Pandas 把 tab-separated 文件读取成两列：
+
+```python
+import pandas as pd
+
+df = pd.read_csv(
+    data_file_path,
+    sep="\t",
+    header=None,
+    names=["Label", "Text"],
+)
+```
+
+Notebook 运行时共读取 5,572 条消息：
+
+| Label  | 含义     |  数量 |
+| ------ | -------- | ----: |
+| `ham`  | 正常消息 | 4,825 |
+| `spam` | 垃圾消息 |   747 |
+
+数据明显不平衡。如果模型永远预测 ham，也可以取得大约 86.6% accuracy，但它完全没有识别垃圾短信的能力。
+
+## 2. 平衡数据并编码 labels
+
+Notebook 对多数类执行 downsampling：
+
+```python
+def create_balanced_dataset(df):
+    num_spam = df[df["Label"] == "spam"].shape[0]
+    ham_subset = df[df["Label"] == "ham"].sample(
+        num_spam,
+        random_state=123,
+    )
+
+    return pd.concat([
+        ham_subset,
+        df[df["Label"] == "spam"],
+    ])
+
+balanced_df = create_balanced_dataset(df)
+balanced_df["Label"] = balanced_df["Label"].map({
+    "ham": 0,
+    "spam": 1,
+})
+```
+
+平衡后的数据包含 747 条 ham 和 747 条 spam，共 1,494 行。
+
+类别平衡让 accuracy 更容易解释，也避免多数类主导 loss。代价是大部分正常消息没有参与训练。其他方案还包括 class-weighted loss、oversampling，以及使用 precision、recall、F1 或 precision-recall curve 等指标。
+
+`random_state=123` 保证每次抽到同一批 ham 数据。
+
+## 3. 切分 train、validation 与 test
+
+平衡后的数据先整体 shuffle，再分为三个互不重叠的子集：
+
+```python
+def random_split(df, train_frac, validation_frac):
+    df = df.sample(
+        frac=1,
+        random_state=123,
+    ).reset_index(drop=True)
+
+    train_end = int(len(df) * train_frac)
+    validation_end = train_end + int(
+        len(df) * validation_frac
+    )
+
+    train_df = df[:train_end]
+    validation_df = df[train_end:validation_end]
+    test_df = df[validation_end:]
+
+    return train_df, validation_df, test_df
+
+train_df, validation_df, test_df = random_split(
+    balanced_df,
+    train_frac=0.7,
+    validation_frac=0.1,
+)
+```
+
+大致比例为：
+
+| 数据集     | 用途                              | 比例 |
+| ---------- | --------------------------------- | ---: |
+| Training   | 优化参数                          |  70% |
+| Validation | 选择设置并监控训练                |  10% |
+| Test       | 在 held-out examples 上做最终评估 |  20% |
+
+在模型和训练方案确定之前，test set 应保持不被使用。如果不断根据 test performance 调整模型，它就会逐渐变成另一个 validation set。
+
+## 4. Tokenize、truncate 与 pad
+
+SMS message 的 token 数量不同，但神经网络的 batch 必须是规则的 rectangular tensor。`SpamDataset` 把每条消息转换为固定长度：
+
+```python
+import tiktoken
+import torch
+from torch.utils.data import Dataset
+
+tokenizer = tiktoken.get_encoding("gpt2")
+
+class SpamDataset(Dataset):
+    def __init__(
+        self,
+        csv_file,
+        tokenizer,
+        max_length=None,
+        pad_token_id=50256,
+    ):
+        self.data = pd.read_csv(csv_file)
+        self.encoded_texts = [
+            tokenizer.encode(text)
+            for text in self.data["Text"]
+        ]
+
+        if max_length is None:
+            self.max_length = self._longest_encoded_length()
+        else:
+            self.max_length = max_length
+            self.encoded_texts = [
+                encoded_text[:self.max_length]
+                for encoded_text in self.encoded_texts
+            ]
+
+        self.encoded_texts = [
+            encoded_text
+            + [pad_token_id]
+            * (self.max_length - len(encoded_text))
+            for encoded_text in self.encoded_texts
+        ]
+
+    def __getitem__(self, index):
+        encoded = self.encoded_texts[index]
+        label = self.data.iloc[index]["Label"]
+        return (
+            torch.tensor(encoded, dtype=torch.long),
+            torch.tensor(label, dtype=torch.long),
+        )
+
+    def __len__(self):
+        return len(self.data)
+
+    def _longest_encoded_length(self):
+        return max(len(text) for text in self.encoded_texts)
+```
+
+训练集决定 `max_length`，validation 和 test 复用同一个值：
+
+```python
+train_dataset = SpamDataset(
+    csv_file="train.csv",
+    tokenizer=tokenizer,
+)
+val_dataset = SpamDataset(
+    csv_file="validation.csv",
+    tokenizer=tokenizer,
+    max_length=train_dataset.max_length,
+)
+test_dataset = SpamDataset(
+    csv_file="test.csv",
+    tokenizer=tokenizer,
+    max_length=train_dataset.max_length,
+)
+```
+
+这样不会让 validation 或 test 的长度信息影响 preprocessing 决策。过长消息被截断；较短消息在右侧补 token ID 50,256，也就是 GPT-2 的 end-of-text token。
+
+Notebook 中的最大长度为 120 tokens，因此一个训练 batch 的 shape 为：
+
+```text
+input_batch:  [8, 120]
+target_batch: [8]
+```
+
+这里每条消息只有一个 label，而不是每个 token 都有一个 target。
+
+## 5. 创建 DataLoaders
+
+```python
+from torch.utils.data import DataLoader
+
+torch.manual_seed(123)
+
+train_loader = DataLoader(
+    dataset=train_dataset,
+    batch_size=8,
+    shuffle=True,
+    num_workers=0,
+    drop_last=True,
+)
+
+val_loader = DataLoader(
+    dataset=val_dataset,
+    batch_size=8,
+    shuffle=False,
+    num_workers=0,
+    drop_last=False,
+)
+
+test_loader = DataLoader(
+    dataset=test_dataset,
+    batch_size=8,
+    shuffle=False,
+    num_workers=0,
+    drop_last=False,
+)
+```
+
+只有训练集需要 shuffle。训练集使用 `drop_last=True`，保持所有训练 batch 大小一致；validation 和 test 保留最后一个不完整 batch，避免遗漏评估样本。
+
+## 6. 加载 pretrained GPT-2
+
+第 5 章已经建立了从 OpenAI checkpoint 到自定义 `GPTModel` 的映射：
+
+```python
+from GPTmodel import GPTModel, load_weights_into_gpt
+from gpt_download import download_and_load_gpt2
+
+choose_model = "gpt2-small (124M)"
+
+base_config = {
+    "vocab_size": 50257,
+    "context_length": 1024,
+    "drop_rate": 0.0,
+    "qkv_bias": True,
+    "emb_dim": 768,
+    "n_layers": 12,
+    "n_heads": 12,
+}
+
+settings, params = download_and_load_gpt2(
+    model_size="124M",
+    models_dir="gpt2",
+)
+
+model = GPTModel(base_config)
+load_weights_into_gpt(model, params)
+model.eval()
+```
+
+Fine-tuning 从预训练得到的语言 representation 开始。如果使用随机权重，这个小型分类数据集就必须同时承担学习语言和识别 spam 两个任务。
+
+这里的 dropout 被设为 0，与本章的实验设置一致。
+
+## 7. 替换 language-model output head
+
+Pretrained output head 会把每个 hidden vector 映射为 50,257 个 vocabulary logits。垃圾短信分类只需要两个 logits：
+
+```text
+替换前: [batch, seq_len, 768]
+          → output head
+        [batch, seq_len, 50,257]
+
+替换后: [batch, seq_len, 768]
+          → classification head
+        [batch, seq_len, 2]
+```
+
+Notebook 先冻结全部 pretrained parameters：
+
+```python
+for param in model.parameters():
+    param.requires_grad = False
+```
+
+然后替换 output head：
+
+```python
+torch.manual_seed(123)
+model.out_head = torch.nn.Linear(
+    in_features=base_config["emb_dim"],
+    out_features=2,
+)
+```
+
+这个新 layer 在冻结循环之后创建，因此其参数默认保持 `requires_grad=True`。
+
+最后，再解冻最后一个 Transformer block 与 final LayerNorm：
+
+```python
+for param in model.trf_blocks[-1].parameters():
+    param.requires_grad = True
+
+for param in model.final_norm.parameters():
+    param.requires_grad = True
+```
+
+最终的训练范围是：
+
+```text
+冻结 token 与 position embeddings
+冻结 Transformer blocks 1–11
+训练 Transformer block 12
+训练 final LayerNorm
+训练二分类 output head
+```
+
+这种选择性 fine-tuning 比更新整个模型更省计算，同时允许最高层 representation 适应新的分类任务。
+
+## 8. 为什么使用最后一个 token position
+
+模型会在序列中每个位置都输出两个 logits，但分类器只取：
+
+```python
+logits = model(input_batch)[:, -1, :]
+```
+
+在 causal attention 中，位置 `t` 的 hidden state 可以读取 `0...t`，但不能看到后续位置。因此，最后一个位置是唯一覆盖完整 padded sequence 的 representation。
+
+由于所有序列被 pad 到相同长度，最后一个 input token 通常是 end-of-text padding token。但它的 hidden state 仍然包含上下文：它可以 attend 到此前所有真实 message tokens。
+
+本章的自定义 GPT 没有使用 attention mask 忽略 padding。Padding 会成为序列的一部分，因此一致的 right-padding 和固定长度会影响模型学到的行为。
+
+## 9. 用 accuracy 评估，用 cross-entropy 训练
+
+Accuracy 很直观：
+
+```python
+def calc_accuracy_loader(
+    data_loader,
+    model,
+    device,
+    num_batches=None,
+):
+    model.eval()
+    correct_predictions = 0
+    num_examples = 0
+
+    if num_batches is None:
+        num_batches = len(data_loader)
+    else:
+        num_batches = min(num_batches, len(data_loader))
+
+    for i, (input_batch, target_batch) in enumerate(data_loader):
+        if i >= num_batches:
+            break
+
+        input_batch = input_batch.to(device)
+        target_batch = target_batch.to(device)
+
+        with torch.no_grad():
+            logits = model(input_batch)[:, -1, :]
+
+        predicted_labels = torch.argmax(logits, dim=-1)
+        num_examples += predicted_labels.shape[0]
+        correct_predictions += (
+            predicted_labels == target_batch
+        ).sum().item()
+
+    return correct_predictions / num_examples
+```
+
+但 argmax 和正确样本计数不可微分，不能直接指导 gradient update。训练需要一个平滑目标：
+
+```python
+def calc_loss_batch(input_batch, target_batch, model, device):
+    input_batch = input_batch.to(device)
+    target_batch = target_batch.to(device)
+    logits = model(input_batch)[:, -1, :]
+    return torch.nn.functional.cross_entropy(
+        logits,
+        target_batch,
+    )
+```
+
+它与语言模型预训练的 shape 不同：
+
+| 任务                  | 传入 cross-entropy 的 logits    | Targets             |
+| --------------------- | ------------------------------- | ------------------- |
+| next-token prediction | `[batch × seq_len, vocab_size]` | `[batch × seq_len]` |
+| SMS classification    | `[batch, 2]`                    | `[batch]`           |
+
+Fine-tuning 之前，随机初始化的新 output head 只有接近随机猜测的 accuracy：
+
+| 数据样本   | 初始 accuracy |
+| ---------- | ------------: |
+| Training   |        46.25% |
+| Validation |        45.00% |
+| Test       |        48.75% |
+
+即使 Transformer 已经有 pretrained knowledge，这也是正常的：新 head 还没有学会如何把 representation 映射到两个 labels。
+
+## 10. 选择计算设备
+
+Model 与所有 batch 必须位于同一个 device：
+
+```python
+device = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+model.to(device)
+```
+
+`torch.cuda.is_available` 后面的括号不能省略。没有括号时，Python 检查的是 function object 本身是否为 truthy，而不是真的询问 CUDA 是否可用。
+
+## 11. Fine-tuning loop
+
+分类训练循环与第 5 章的预训练循环结构相似：
+
+```python
+def train_classifier_simple(
+    model,
+    train_loader,
+    val_loader,
+    optimizer,
+    device,
+    num_epochs,
+    eval_freq,
+    eval_iter,
+):
+    train_losses, val_losses = [], []
+    train_accs, val_accs = [], []
+    examples_seen, global_step = 0, -1
+
+    for epoch in range(num_epochs):
+        model.train()
+
+        for input_batch, target_batch in train_loader:
+            optimizer.zero_grad()
+            loss = calc_loss_batch(
+                input_batch,
+                target_batch,
+                model,
+                device,
+            )
+            loss.backward()
+            optimizer.step()
+
+            examples_seen += input_batch.shape[0]
+            global_step += 1
+
+            if global_step % eval_freq == 0:
+                train_loss, val_loss = evaluate_model(
+                    model,
+                    train_loader,
+                    val_loader,
+                    device,
+                    eval_iter,
+                )
+                train_losses.append(train_loss)
+                val_losses.append(val_loss)
+
+        train_accuracy = calc_accuracy_loader(
+            train_loader,
+            model,
+            device,
+            num_batches=eval_iter,
+        )
+        val_accuracy = calc_accuracy_loader(
+            val_loader,
+            model,
+            device,
+            num_batches=eval_iter,
+        )
+        train_accs.append(train_accuracy)
+        val_accs.append(val_accuracy)
+
+    return (
+        train_losses,
+        val_losses,
+        train_accs,
+        val_accs,
+        examples_seen,
+    )
+```
+
+Optimizer 接收 `model.parameters()`，但被冻结的参数 `requires_grad=False`，不会获得 gradient，也不会发生更新：
+
+```python
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=5e-5,
+    weight_decay=0.1,
+)
+```
+
+这里的 learning rate 明显小于第 5 章的预训练演示。Fine-tuning 从已有的有效参数开始，过大的更新可能破坏 pretrained representation。
+
+## 12. 理解训练结果
+
+训练五个 epochs 后，Notebook 得到：
+
+| 数据集     | 最终 accuracy |
+| ---------- | ------------: |
+| Training   |        97.21% |
+| Validation |        97.32% |
+| Test       |        95.67% |
+
+Test accuracy 明显高于最初的随机水平，说明可训练层已经学会了垃圾短信任务。
+
+Training 与 validation 曲线有不同作用：
+
+- Loss 表示 gradient-based optimization 是否还在改善目标。
+- Accuracy 表示最终 class decision 有多少是正确的。
+- Training 与 validation 的差距持续扩大，可能意味着 overfitting。
+
+Accuracy 并不是生产场景下的完整指标。Spam filtering 中 false positive 与 false negative 的成本不同。后续评估还应加入 confusion matrix、spam precision、spam recall 和 F1，并使用能反映真实类别比例的 test set。
+
+## 13. 对新消息分类
+
+Inference 必须复现训练时的 preprocessing：
+
+```python
+def classify_text(
+    text,
+    model,
+    tokenizer,
+    device,
+    max_length,
+    pad_token_id=50256,
+):
+    model.eval()
+
+    supported_context_length = model.pos_emb.weight.shape[0]
+    effective_max_length = min(
+        max_length,
+        supported_context_length,
+    )
+
+    input_ids = tokenizer.encode(text)
+    input_ids = input_ids[:effective_max_length]
+    input_ids += [pad_token_id] * (
+        effective_max_length - len(input_ids)
+    )
+
+    input_tensor = torch.tensor(
+        input_ids,
+        device=device,
+    ).unsqueeze(0)
+
+    with torch.no_grad():
+        logits = model(input_tensor)[:, -1, :]
+
+    predicted_label = torch.argmax(
+        logits,
+        dim=-1,
+    ).item()
+
+    return "spam" if predicted_label == 1 else "not spam"
+```
+
+Notebook 把一条中奖消息判断为 spam，把一条普通的晚餐约定消息判断为 not spam。
+
+函数同时根据 dataset maximum length 和模型支持的 context length 限制输入，再 right-pad 到 fine-tuning 时使用的固定长度。
+
+## 14. 保存 fine-tuned classifier
+
+```python
+torch.save(
+    model.state_dict(),
+    "spam_classifier.pth",
+)
+```
+
+恢复分类器时必须重复同样的架构步骤：
+
+1. 创建 GPT-2 base configuration。
+2. 把 vocabulary output head 替换为二分类 linear head。
+3. 加载保存的 state dictionary。
+4. 把模型移动到 inference device，并调用 `eval()`。
+
+Preprocessing contract 也必须保留：tokenizer、pad token ID、label mapping 和 maximum sequence length 都是部署后分类器的一部分，尽管它们不会自动存入 `state_dict`。
+
+## 15. Pretraining 与 fine-tuning 改变了什么？
+
+| 方面             | 第 5 章 pretraining            | 第 6 章 classification          |
+| ---------------- | ------------------------------ | ------------------------------- |
+| 数据             | 无标签文本                     | 带 labels 的 SMS messages       |
+| Target           | 每个位置的 next token          | 每条消息的一个 class            |
+| Output size      | 50,257                         | 2                               |
+| 参与 loss 的位置 | 全部位置                       | 最后一个位置                    |
+| 初始权重         | 演示时为随机值                 | pretrained GPT-2                |
+| 可训练参数       | 整个模型                       | head、final norm、final block   |
+| 主要评估         | language-model loss 与 samples | loss 与 classification accuracy |
+
+Transformer body 并不只服务于一个输出任务。Pretraining 学到可复用的 representation；fine-tuning 则改变模型接口，并让部分参数适配一个更窄的目标。
+
+## 16. 最终理解
+
+我在这一章得到的主要认识是：
+
+1. 在 imbalanced data 上，较高 accuracy 也可能具有误导性，所以应先检查 label distribution。
+2. Train、validation 与 test 各有不同用途，应保持相互独立。
+3. 不同长度的文本需要通过 truncation 和 padding 变成统一 tensor。
+4. 把 vocabulary head 换成 task-specific head，就能让 pretrained language model 变成 classifier。
+5. 冻结大部分参数可以减少计算，并帮助保留通用语言 representation。
+6. 最后一个 token representation 可以汇总此前的 causal context，并输入分类器。
+7. Cross-entropy 提供可微分训练信号；accuracy 提供直观评估结果。
+8. 部署时不仅需要 learned weights，还需要完整保存 preprocessing configuration。
+
+从第 2 章到这里，已经形成一条完整路径：
+
+```text
+tokenization
+  → attention
+  → GPT architecture
+  → language-model pretraining
+  → pretrained weights
+  → task-specific fine-tuning
+```
+
+## 参考资料
+
+- [Build a Large Language Model (From Scratch)](https://www.manning.com/books/build-a-large-language-model-from-scratch)
+- [官方 LLMs-from-scratch GitHub 仓库](https://github.com/rasbt/LLMs-from-scratch)
+- [官方 Chapter 6 notebook](https://github.com/rasbt/LLMs-from-scratch/blob/main/ch06/01_main-chapter-code/ch06.ipynb)
+- [UCI SMS Spam Collection](https://archive.ics.uci.edu/dataset/228/sms+spam+collection)
+- [PyTorch transfer learning 教程](https://pytorch.org/tutorials/beginner/transfer_learning_tutorial.html)

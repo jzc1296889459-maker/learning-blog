@@ -1,0 +1,688 @@
+---
+title: 'Fine-Tuning GPT for Classification: Chapter 6'
+description: 'Adapting pretrained GPT-2 into an SMS spam classifier with balanced data, a new output head, and selective fine-tuning.'
+date: 2026-08-20
+tags:
+  - llm
+  - pytorch
+  - fine-tuning
+  - classification
+  - book-notes
+language: 'en'
+translationKey: '20260820---llm-from-scratch-ch06-classification'
+type: note
+status: in-progress
+draft: false
+---
+
+> **Source note**
+>
+> This article is my study note following Chapter 6, “Fine-tuning for Classification,” of Sebastian Raschka’s [_Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch). The code comes from the book and its [official Chapter 6 companion code](https://github.com/rasbt/LLMs-from-scratch/tree/main/ch06/01_main-chapter-code). The code remains the author’s work and is distributed under the official repository’s Apache 2.0 license. Codex generated this first draft from the Jupyter notebook I wrote while studying. This note does not replace the book; it records how I understand the transition from next-token prediction to text classification.
+
+Chapter 5 loaded GPT-2 weights learned from next-token prediction. Chapter 6 reuses that language knowledge for a different task: deciding whether an SMS message is spam.
+
+```text
+raw SMS messages
+  → balance labels and split datasets
+  → tokenize, truncate, and pad
+  → pretrained GPT-2
+  → representation at the final position
+  → two-class output head
+  → cross-entropy and selective fine-tuning
+  → spam / not spam
+```
+
+This is supervised fine-tuning: unlike pretraining, every message now has an explicit class label.
+
+## 1. Downloading the SMS Spam Collection
+
+The notebook downloads the SMS Spam Collection from the UCI Machine Learning Repository:
+
+```python
+import os
+import urllib.request
+import zipfile
+from pathlib import Path
+
+url = (
+    "https://archive.ics.uci.edu/static/public/228/"
+    "sms+spam+collection.zip"
+)
+zip_path = "sms_spam_collection.zip"
+extracted_path = "sms_spam_collection"
+data_file_path = (
+    Path(extracted_path) / "SMSSpamCollection.tsv"
+)
+
+def download_and_unzip_spam_data(
+    url,
+    zip_path,
+    extracted_path,
+    data_file_path,
+):
+    if data_file_path.exists():
+        print("Dataset already exists. Skipping download.")
+        return
+
+    with urllib.request.urlopen(url) as response:
+        with open(zip_path, "wb") as out_file:
+            out_file.write(response.read())
+
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        zip_ref.extractall(extracted_path)
+
+    original_path = Path(extracted_path) / "SMSSpamCollection"
+    os.rename(original_path, data_file_path)
+```
+
+The existence check makes the operation idempotent: rerunning the notebook does not repeatedly download or extract the same file.
+
+Pandas loads the tab-separated file into two columns:
+
+```python
+import pandas as pd
+
+df = pd.read_csv(
+    data_file_path,
+    sep="\t",
+    header=None,
+    names=["Label", "Text"],
+)
+```
+
+The original notebook run contained 5,572 messages:
+
+| Label  | Meaning            | Count |
+| ------ | ------------------ | ----: |
+| `ham`  | legitimate message | 4,825 |
+| `spam` | unwanted message   |   747 |
+
+This is a strongly imbalanced dataset. A classifier that always predicts “ham” would already reach about 86.6% accuracy while being useless for spam detection.
+
+## 2. Balancing and encoding the labels
+
+The notebook downsamples the majority class:
+
+```python
+def create_balanced_dataset(df):
+    num_spam = df[df["Label"] == "spam"].shape[0]
+    ham_subset = df[df["Label"] == "ham"].sample(
+        num_spam,
+        random_state=123,
+    )
+
+    return pd.concat([
+        ham_subset,
+        df[df["Label"] == "spam"],
+    ])
+
+balanced_df = create_balanced_dataset(df)
+balanced_df["Label"] = balanced_df["Label"].map({
+    "ham": 0,
+    "spam": 1,
+})
+```
+
+The balanced table contains 747 examples of each class, or 1,494 rows total.
+
+Balancing makes accuracy easier to interpret and prevents the majority class from dominating the loss. The tradeoff is that most legitimate messages are discarded. Alternatives include class-weighted loss, oversampling, or metrics such as precision, recall, F1, and area under the precision-recall curve.
+
+`random_state=123` ensures that the same ham subset is selected each time.
+
+## 3. Creating train, validation, and test splits
+
+The balanced data is shuffled once and divided into three non-overlapping subsets:
+
+```python
+def random_split(df, train_frac, validation_frac):
+    df = df.sample(
+        frac=1,
+        random_state=123,
+    ).reset_index(drop=True)
+
+    train_end = int(len(df) * train_frac)
+    validation_end = train_end + int(
+        len(df) * validation_frac
+    )
+
+    train_df = df[:train_end]
+    validation_df = df[train_end:validation_end]
+    test_df = df[validation_end:]
+
+    return train_df, validation_df, test_df
+
+train_df, validation_df, test_df = random_split(
+    balanced_df,
+    train_frac=0.7,
+    validation_frac=0.1,
+)
+```
+
+The resulting proportions are approximately:
+
+| Split      | Purpose                              | Fraction |
+| ---------- | ------------------------------------ | -------: |
+| Training   | optimize parameters                  |      70% |
+| Validation | select settings and monitor training |      10% |
+| Test       | final estimate on held-out examples  |      20% |
+
+The test set should remain untouched until model and training decisions are complete. Repeatedly tuning against test performance would turn it into another validation set.
+
+## 4. Tokenizing, truncating, and padding messages
+
+Neural-network batches require rectangular tensors, but SMS messages contain different numbers of tokens. `SpamDataset` converts each message to a fixed-length sequence:
+
+```python
+import tiktoken
+import torch
+from torch.utils.data import Dataset
+
+tokenizer = tiktoken.get_encoding("gpt2")
+
+class SpamDataset(Dataset):
+    def __init__(
+        self,
+        csv_file,
+        tokenizer,
+        max_length=None,
+        pad_token_id=50256,
+    ):
+        self.data = pd.read_csv(csv_file)
+        self.encoded_texts = [
+            tokenizer.encode(text)
+            for text in self.data["Text"]
+        ]
+
+        if max_length is None:
+            self.max_length = self._longest_encoded_length()
+        else:
+            self.max_length = max_length
+            self.encoded_texts = [
+                encoded_text[:self.max_length]
+                for encoded_text in self.encoded_texts
+            ]
+
+        self.encoded_texts = [
+            encoded_text
+            + [pad_token_id]
+            * (self.max_length - len(encoded_text))
+            for encoded_text in self.encoded_texts
+        ]
+
+    def __getitem__(self, index):
+        encoded = self.encoded_texts[index]
+        label = self.data.iloc[index]["Label"]
+        return (
+            torch.tensor(encoded, dtype=torch.long),
+            torch.tensor(label, dtype=torch.long),
+        )
+
+    def __len__(self):
+        return len(self.data)
+
+    def _longest_encoded_length(self):
+        return max(len(text) for text in self.encoded_texts)
+```
+
+The training set determines `max_length`. Validation and test examples reuse that value:
+
+```python
+train_dataset = SpamDataset(
+    csv_file="train.csv",
+    tokenizer=tokenizer,
+)
+val_dataset = SpamDataset(
+    csv_file="validation.csv",
+    tokenizer=tokenizer,
+    max_length=train_dataset.max_length,
+)
+test_dataset = SpamDataset(
+    csv_file="test.csv",
+    tokenizer=tokenizer,
+    max_length=train_dataset.max_length,
+)
+```
+
+This avoids letting validation or test lengths influence preprocessing choices. Longer messages are truncated; shorter messages are right-padded with token ID 50,256, GPT-2’s end-of-text token.
+
+The notebook’s maximum length was 120 tokens, so one training batch had:
+
+```text
+input_batch:  [8, 120]
+target_batch: [8]
+```
+
+Each message has one label rather than one target per token.
+
+## 5. Constructing the DataLoaders
+
+```python
+from torch.utils.data import DataLoader
+
+torch.manual_seed(123)
+
+train_loader = DataLoader(
+    dataset=train_dataset,
+    batch_size=8,
+    shuffle=True,
+    num_workers=0,
+    drop_last=True,
+)
+
+val_loader = DataLoader(
+    dataset=val_dataset,
+    batch_size=8,
+    shuffle=False,
+    num_workers=0,
+    drop_last=False,
+)
+
+test_loader = DataLoader(
+    dataset=test_dataset,
+    batch_size=8,
+    shuffle=False,
+    num_workers=0,
+    drop_last=False,
+)
+```
+
+Only the training set is shuffled. `drop_last=True` keeps all training batches the same size; validation and test keep their final partial batch so no evaluation example is lost.
+
+## 6. Loading the pretrained GPT-2 model
+
+Chapter 5 already built the bridge from OpenAI’s checkpoint to the custom `GPTModel`:
+
+```python
+from GPTmodel import GPTModel, load_weights_into_gpt
+from gpt_download import download_and_load_gpt2
+
+choose_model = "gpt2-small (124M)"
+
+base_config = {
+    "vocab_size": 50257,
+    "context_length": 1024,
+    "drop_rate": 0.0,
+    "qkv_bias": True,
+    "emb_dim": 768,
+    "n_layers": 12,
+    "n_heads": 12,
+}
+
+settings, params = download_and_load_gpt2(
+    model_size="124M",
+    models_dir="gpt2",
+)
+
+model = GPTModel(base_config)
+load_weights_into_gpt(model, params)
+model.eval()
+```
+
+Fine-tuning begins with language representations learned during pretraining. Starting from random weights would require the small classification dataset to learn both language and spam detection at once.
+
+Dropout is set to 0 in this configuration, matching the chapter’s setup.
+
+## 7. Replacing the language-model output head
+
+The pretrained output head maps each hidden vector to 50,257 vocabulary logits. Spam classification needs only two logits:
+
+```text
+before: [batch, seq_len, 768]
+          → output head
+        [batch, seq_len, 50,257]
+
+after:  [batch, seq_len, 768]
+          → classification head
+        [batch, seq_len, 2]
+```
+
+The notebook first freezes every pretrained parameter:
+
+```python
+for param in model.parameters():
+    param.requires_grad = False
+```
+
+It then replaces the output head:
+
+```python
+torch.manual_seed(123)
+model.out_head = torch.nn.Linear(
+    in_features=base_config["emb_dim"],
+    out_features=2,
+)
+```
+
+Because this new layer is created after the freezing loop, its parameters default to `requires_grad=True`.
+
+Finally, the last Transformer block and final LayerNorm are unfrozen:
+
+```python
+for param in model.trf_blocks[-1].parameters():
+    param.requires_grad = True
+
+for param in model.final_norm.parameters():
+    param.requires_grad = True
+```
+
+The trainable part is therefore:
+
+```text
+frozen token and position embeddings
+frozen Transformer blocks 1–11
+trainable Transformer block 12
+trainable final LayerNorm
+trainable two-class output head
+```
+
+This selective strategy is cheaper than updating the entire model while still allowing its highest-level representations to adapt to the classification task.
+
+## 8. Why the final token position is used
+
+The model produces two logits at every sequence position, but the classifier uses only:
+
+```python
+logits = model(input_batch)[:, -1, :]
+```
+
+With causal attention, the hidden state at position `t` can attend to positions `0...t` but not future positions. The last position is therefore the only one whose receptive field covers the complete padded sequence.
+
+Because every sequence is padded to the same length, the last input token is often an end-of-text padding token. Its hidden state is still contextual: it can attend to all message tokens that came before it.
+
+This chapter’s custom GPT implementation does not use an attention mask to ignore padding. Padding is part of the sequence, so consistent right-padding and fixed lengths are important to the behavior being learned.
+
+## 9. Accuracy for evaluation, cross-entropy for training
+
+Accuracy is easy to understand:
+
+```python
+def calc_accuracy_loader(
+    data_loader,
+    model,
+    device,
+    num_batches=None,
+):
+    model.eval()
+    correct_predictions = 0
+    num_examples = 0
+
+    if num_batches is None:
+        num_batches = len(data_loader)
+    else:
+        num_batches = min(num_batches, len(data_loader))
+
+    for i, (input_batch, target_batch) in enumerate(data_loader):
+        if i >= num_batches:
+            break
+
+        input_batch = input_batch.to(device)
+        target_batch = target_batch.to(device)
+
+        with torch.no_grad():
+            logits = model(input_batch)[:, -1, :]
+
+        predicted_labels = torch.argmax(logits, dim=-1)
+        num_examples += predicted_labels.shape[0]
+        correct_predictions += (
+            predicted_labels == target_batch
+        ).sum().item()
+
+    return correct_predictions / num_examples
+```
+
+However, argmax and the count of correct predictions are not differentiable. Training needs a smooth objective:
+
+```python
+def calc_loss_batch(input_batch, target_batch, model, device):
+    input_batch = input_batch.to(device)
+    target_batch = target_batch.to(device)
+    logits = model(input_batch)[:, -1, :]
+    return torch.nn.functional.cross_entropy(
+        logits,
+        target_batch,
+    )
+```
+
+The shapes now differ from language-model pretraining:
+
+| Task                  | Logits sent to cross-entropy    | Targets             |
+| --------------------- | ------------------------------- | ------------------- |
+| next-token prediction | `[batch × seq_len, vocab_size]` | `[batch × seq_len]` |
+| SMS classification    | `[batch, 2]`                    | `[batch]`           |
+
+Before fine-tuning, the new random output head achieved roughly chance-level accuracy:
+
+| Split sample | Initial accuracy |
+| ------------ | ---------------: |
+| Training     |           46.25% |
+| Validation   |           45.00% |
+| Test         |           48.75% |
+
+This is expected even though the Transformer contains pretrained knowledge: the new head has not learned how to map its representations to the two labels.
+
+## 10. Device selection
+
+The model and every batch must be on the same device:
+
+```python
+device = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+model.to(device)
+```
+
+The parentheses after `torch.cuda.is_available` matter. Without them, Python tests the truthiness of the function object rather than asking whether CUDA is actually available.
+
+## 11. Fine-tuning loop
+
+The classifier loop is structurally similar to pretraining:
+
+```python
+def train_classifier_simple(
+    model,
+    train_loader,
+    val_loader,
+    optimizer,
+    device,
+    num_epochs,
+    eval_freq,
+    eval_iter,
+):
+    train_losses, val_losses = [], []
+    train_accs, val_accs = [], []
+    examples_seen, global_step = 0, -1
+
+    for epoch in range(num_epochs):
+        model.train()
+
+        for input_batch, target_batch in train_loader:
+            optimizer.zero_grad()
+            loss = calc_loss_batch(
+                input_batch,
+                target_batch,
+                model,
+                device,
+            )
+            loss.backward()
+            optimizer.step()
+
+            examples_seen += input_batch.shape[0]
+            global_step += 1
+
+            if global_step % eval_freq == 0:
+                train_loss, val_loss = evaluate_model(
+                    model,
+                    train_loader,
+                    val_loader,
+                    device,
+                    eval_iter,
+                )
+                train_losses.append(train_loss)
+                val_losses.append(val_loss)
+
+        train_accuracy = calc_accuracy_loader(
+            train_loader,
+            model,
+            device,
+            num_batches=eval_iter,
+        )
+        val_accuracy = calc_accuracy_loader(
+            val_loader,
+            model,
+            device,
+            num_batches=eval_iter,
+        )
+        train_accs.append(train_accuracy)
+        val_accs.append(val_accuracy)
+
+    return (
+        train_losses,
+        val_losses,
+        train_accs,
+        val_accs,
+        examples_seen,
+    )
+```
+
+The optimizer receives `model.parameters()`, but frozen parameters have `requires_grad=False` and therefore do not receive gradients or updates:
+
+```python
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=5e-5,
+    weight_decay=0.1,
+)
+```
+
+The learning rate is much smaller than the Chapter 5 pretraining demonstration. Fine-tuning begins with useful pretrained weights, so large updates could destroy learned representations.
+
+## 12. Interpreting the results
+
+After five epochs, the notebook reported:
+
+| Split      | Final accuracy |
+| ---------- | -------------: |
+| Training   |         97.21% |
+| Validation |         97.32% |
+| Test       |         95.67% |
+
+The test result is much better than the initial chance-level performance, showing that the trainable layers learned the spam task.
+
+Training and validation curves serve different purposes:
+
+- Loss shows whether gradient-based optimization is still improving the objective.
+- Accuracy shows how often the final class decision is correct.
+- A widening train–validation gap can indicate overfitting.
+
+Accuracy alone is not a complete production metric. For spam filtering, false positives and false negatives have different costs. A future evaluation should include a confusion matrix, spam precision, spam recall, and F1 score, preferably on a test set that reflects the real class ratio.
+
+## 13. Classifying new messages
+
+Inference must reproduce the same preprocessing used for training:
+
+```python
+def classify_text(
+    text,
+    model,
+    tokenizer,
+    device,
+    max_length,
+    pad_token_id=50256,
+):
+    model.eval()
+
+    supported_context_length = model.pos_emb.weight.shape[0]
+    effective_max_length = min(
+        max_length,
+        supported_context_length,
+    )
+
+    input_ids = tokenizer.encode(text)
+    input_ids = input_ids[:effective_max_length]
+    input_ids += [pad_token_id] * (
+        effective_max_length - len(input_ids)
+    )
+
+    input_tensor = torch.tensor(
+        input_ids,
+        device=device,
+    ).unsqueeze(0)
+
+    with torch.no_grad():
+        logits = model(input_tensor)[:, -1, :]
+
+    predicted_label = torch.argmax(
+        logits,
+        dim=-1,
+    ).item()
+
+    return "spam" if predicted_label == 1 else "not spam"
+```
+
+The Notebook classified a prize message as spam and an ordinary dinner-plan message as not spam.
+
+The function caps the input at both the dataset’s maximum length and the model’s supported context length. It then right-pads to exactly the length used during fine-tuning.
+
+## 14. Saving the fine-tuned classifier
+
+```python
+torch.save(
+    model.state_dict(),
+    "spam_classifier.pth",
+)
+```
+
+Restoring the classifier requires the same sequence of architectural steps:
+
+1. Create the GPT-2 base configuration.
+2. Replace the vocabulary output head with a two-class linear head.
+3. Load the saved state dictionary.
+4. Move the model to the inference device and call `eval()`.
+
+The preprocessing contract must also be preserved: tokenizer, pad token ID, label mapping, and maximum sequence length are all part of the deployed classifier even though they are not stored in `state_dict`.
+
+## 15. What changed between pretraining and fine-tuning?
+
+| Aspect                 | Chapter 5 pretraining           | Chapter 6 classification         |
+| ---------------------- | ------------------------------- | -------------------------------- |
+| Data                   | unlabeled text                  | SMS messages with labels         |
+| Target                 | next token at every position    | one class per message            |
+| Output size            | 50,257                          | 2                                |
+| Position used for loss | all positions                   | final position                   |
+| Starting weights       | random for demonstration        | pretrained GPT-2                 |
+| Trainable parameters   | whole model                     | head, final norm, final block    |
+| Main evaluation        | language-model loss and samples | loss and classification accuracy |
+
+The Transformer body is not tied to a single output task. Pretraining learns reusable representations; fine-tuning changes the interface and adapts some parameters to a narrower objective.
+
+## 16. Final understanding
+
+My main takeaways are:
+
+1. A high accuracy on imbalanced data can be misleading, so the label distribution must be inspected first.
+2. Train, validation, and test data have distinct roles and should remain separate.
+3. Variable-length text must be converted into consistent tensors through truncation and padding.
+4. A pretrained language model becomes a classifier by replacing its vocabulary head with a task-specific head.
+5. Freezing most parameters reduces computation and helps preserve general language representations.
+6. The final token representation can summarize the preceding causal context and feed the classifier.
+7. Cross-entropy provides differentiable training signals; accuracy provides an interpretable evaluation metric.
+8. Deployment requires the preprocessing configuration as well as the learned weights.
+
+This chapter completes a full path from raw text to a specialized application:
+
+```text
+tokenization
+  → attention
+  → GPT architecture
+  → language-model pretraining
+  → pretrained weights
+  → task-specific fine-tuning
+```
+
+## References
+
+- [Build a Large Language Model (From Scratch)](https://www.manning.com/books/build-a-large-language-model-from-scratch)
+- [Official LLMs-from-scratch GitHub repository](https://github.com/rasbt/LLMs-from-scratch)
+- [Official Chapter 6 notebook](https://github.com/rasbt/LLMs-from-scratch/blob/main/ch06/01_main-chapter-code/ch06.ipynb)
+- [UCI SMS Spam Collection](https://archive.ics.uci.edu/dataset/228/sms+spam+collection)
+- [PyTorch transfer learning tutorial](https://pytorch.org/tutorials/beginner/transfer_learning_tutorial.html)
