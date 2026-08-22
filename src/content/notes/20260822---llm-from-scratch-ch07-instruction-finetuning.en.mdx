@@ -1,0 +1,635 @@
+---
+title: 'Fine-Tuning GPT to Follow Instructions: Chapter 7'
+description: 'Formatting instruction data, masking padded targets, fine-tuning GPT-2 medium, and evaluating responses with a local LLM judge.'
+date: 2026-08-22
+tags:
+  - llm
+  - pytorch
+  - fine-tuning
+  - instruction-tuning
+  - book-notes
+language: 'en'
+translationKey: '20260822---llm-from-scratch-ch07-instruction-finetuning'
+type: note
+status: in-progress
+draft: false
+---
+
+> **Source note**
+>
+> This article is my study note following Chapter 7, “Fine-tuning to Follow Instructions,” of Sebastian Raschka’s [_Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch). The code comes from the book and its [official Chapter 7 companion code](https://github.com/rasbt/LLMs-from-scratch/tree/main/ch07/01_main-chapter-code). The code remains the author’s work and is distributed under the official repository’s Apache 2.0 license. Codex generated this first draft from the Jupyter notebook I wrote while studying. This note does not replace the book; it records how I understand instruction formatting, target masking, fine-tuning, and response evaluation.
+
+Chapter 6 changed a pretrained GPT into a classifier. Chapter 7 keeps the language-model output head and instead teaches the model a new text-generation pattern: read an instruction and produce an appropriate response.
+
+```text
+instruction + optional input + desired response
+  → one formatted training sequence
+  → tokenize and dynamically pad a batch
+  → shifted next-token targets
+  → ignore repeated padding in the loss
+  → fine-tune pretrained GPT-2
+  → generate responses for unseen instructions
+  → inspect manually and score with an LLM judge
+```
+
+This is still next-token prediction. The main change is the structure and purpose of the training text.
+
+## 1. The instruction dataset
+
+The notebook downloads a JSON file containing 1,100 instruction examples:
+
+```python
+import json
+import os
+import urllib.request
+
+def download_and_load_file(file_path, url):
+    if not os.path.exists(file_path):
+        with urllib.request.urlopen(url) as response:
+            text_data = response.read().decode("utf-8")
+        with open(file_path, "w", encoding="utf-8") as file:
+            file.write(text_data)
+
+    with open(file_path, "r", encoding="utf-8") as file:
+        return json.load(file)
+
+file_path = "instruction-data.json"
+url = (
+    "https://raw.githubusercontent.com/rasbt/"
+    "LLMs-from-scratch/main/ch07/01_main-chapter-code/"
+    "instruction-data.json"
+)
+data = download_and_load_file(file_path, url)
+```
+
+Each entry has three fields:
+
+```python
+{
+    "instruction": "Identify the correct spelling of the following word.",
+    "input": "Ocassion",
+    "output": "The correct spelling is 'Occasion.'",
+}
+```
+
+| Field         | Role                                    |
+| ------------- | --------------------------------------- |
+| `instruction` | describes the task                      |
+| `input`       | provides optional task-specific context |
+| `output`      | contains the desired answer             |
+
+The data is supervised because `output` is an explicit target response.
+
+## 2. Formatting a prompt template
+
+Models do not inherently know what the JSON keys mean. The fields are converted into a consistent text template:
+
+```python
+def format_input(entry):
+    instruction_text = (
+        "Below is an instruction that describes a task. "
+        "Write a response that appropriately completes the request."
+        f"\n\n### Instruction:\n{entry['instruction']}"
+    )
+
+    input_text = (
+        f"\n\n### Input:\n{entry['input']}"
+        if entry["input"]
+        else ""
+    )
+
+    return instruction_text + input_text
+```
+
+The desired response is added separately:
+
+```python
+model_input = format_input(entry)
+desired_response = f"\n\n### Response:\n{entry['output']}"
+full_text = model_input + desired_response
+```
+
+A complete training example becomes:
+
+```text
+Below is an instruction that describes a task.
+Write a response that appropriately completes the request.
+
+### Instruction:
+Identify the correct spelling of the following word.
+
+### Input:
+Ocassion
+
+### Response:
+The correct spelling is 'Occasion.'
+```
+
+The `Input` section is omitted when it is empty. The fixed headings teach the model where the task ends and the answer begins.
+
+At inference time, the model receives only `format_input(entry)`. It must generate the response section from the learned pattern.
+
+## 3. Splitting the examples
+
+The notebook uses 85% for training, 10% for testing, and the remainder for validation:
+
+```python
+train_portion = int(len(data) * 0.85)
+test_portion = int(len(data) * 0.10)
+
+train_data = data[:train_portion]
+test_data = data[
+    train_portion : train_portion + test_portion
+]
+val_data = data[train_portion + test_portion :]
+```
+
+For 1,100 entries, this produces:
+
+| Split      | Entries | Purpose                      |
+| ---------- | ------: | ---------------------------- |
+| Training   |     935 | update model parameters      |
+| Validation |      55 | monitor fine-tuning          |
+| Test       |     110 | evaluate unseen instructions |
+
+The split is deterministic because it uses fixed slices. This assumes the source data order is suitable; if examples were grouped by task type, shuffling before splitting would be important.
+
+## 4. Tokenizing full instruction–response sequences
+
+`InstructionDataset` formats and tokenizes every complete example once:
+
+```python
+import tiktoken
+from torch.utils.data import Dataset
+
+tokenizer = tiktoken.get_encoding("gpt2")
+
+class InstructionDataset(Dataset):
+    def __init__(self, data, tokenizer):
+        self.data = data
+        self.encoded_texts = []
+
+        for entry in data:
+            instruction_plus_input = format_input(entry)
+            response_text = (
+                f"\n\n### Response:\n{entry['output']}"
+            )
+            full_text = instruction_plus_input + response_text
+            self.encoded_texts.append(
+                tokenizer.encode(full_text)
+            )
+
+    def __getitem__(self, index):
+        return self.encoded_texts[index]
+
+    def __len__(self):
+        return len(self.data)
+```
+
+Unlike Chapter 6, `__getitem__` does not return a separate class label. The answer is already part of the token sequence, and shifted copies of that sequence will become inputs and targets.
+
+## 5. Why batching needs a custom collate function
+
+Instruction examples have different lengths. Instead of padding the entire dataset to one global maximum, the collate function pads only to the longest item in the current batch.
+
+The GPT-2 end-of-text token is used as the padding token:
+
+```python
+tokenizer.encode(
+    "<|endoftext|>",
+    allowed_special={"<|endoftext|>"},
+)
+# [50256]
+```
+
+For every item, the collate function:
+
+1. Appends one end-of-text token.
+2. Pads to the batch maximum length.
+3. Creates inputs by removing the last token.
+4. Creates targets by removing the first token.
+
+```text
+padded:  [0, 1, 2, 3, 4, EOT]
+inputs:  [0, 1, 2, 3, 4]
+targets: [1, 2, 3, 4, EOT]
+```
+
+The EOT token is absent from the final input position but remains the final meaningful target. This teaches the model to end its response.
+
+## 6. Ignoring repeated padding targets
+
+If every padding token contributed to cross-entropy, short examples would spend much of their loss teaching the model to predict EOT repeatedly. The final collate function keeps the first EOT target and changes later padding targets to `-100`:
+
+```python
+import torch
+
+def custom_collate_fn(
+    batch,
+    pad_token_id=50256,
+    ignore_index=-100,
+    allowed_max_length=None,
+    device="cpu",
+):
+    batch_max_length = max(len(item) + 1 for item in batch)
+    inputs_list = []
+    targets_list = []
+
+    for item in batch:
+        new_item = item.copy()
+        new_item += [pad_token_id]
+
+        padded = new_item + [pad_token_id] * (
+            batch_max_length - len(new_item)
+        )
+
+        inputs = torch.tensor(padded[:-1])
+        targets = torch.tensor(padded[1:])
+
+        mask = targets == pad_token_id
+        indices = torch.nonzero(mask).flatten()
+        if indices.numel() > 1:
+            targets[indices[1:]] = ignore_index
+
+        if allowed_max_length is not None:
+            inputs = inputs[:allowed_max_length]
+            targets = targets[:allowed_max_length]
+
+        inputs_list.append(inputs)
+        targets_list.append(targets)
+
+    inputs_tensor = torch.stack(inputs_list).to(device)
+    targets_tensor = torch.stack(targets_list).to(device)
+    return inputs_tensor, targets_tensor
+```
+
+PyTorch cross-entropy uses `ignore_index=-100` by default. Positions with that target do not contribute to the mean loss or gradients:
+
+```python
+loss = torch.nn.functional.cross_entropy(
+    logits.flatten(0, 1),
+    targets.flatten(),
+)
+```
+
+The first EOT remains target 50,256 so the model learns when to stop. Only additional EOT padding is ignored.
+
+As implemented here, loss is still calculated over the instruction, optional input, response heading, and response tokens. The mask removes padding; it does not restrict training to response tokens only.
+
+## 7. Binding batch settings with partial
+
+The DataLoader expects a callable that accepts a batch. `functools.partial` preconfigures the device and maximum sequence length:
+
+```python
+from functools import partial
+
+device = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+customized_collate_fn = partial(
+    custom_collate_fn,
+    device=device,
+    allowed_max_length=1024,
+)
+```
+
+This is equivalent to creating a small wrapper function, but avoids repeating a new definition.
+
+Truncating at 1,024 keeps every batch within GPT-2’s positional embedding range.
+
+## 8. Creating the DataLoaders
+
+```python
+from torch.utils.data import DataLoader
+
+torch.manual_seed(123)
+
+train_loader = DataLoader(
+    InstructionDataset(train_data, tokenizer),
+    batch_size=8,
+    collate_fn=customized_collate_fn,
+    shuffle=True,
+    drop_last=True,
+    num_workers=0,
+)
+
+val_loader = DataLoader(
+    InstructionDataset(val_data, tokenizer),
+    batch_size=8,
+    collate_fn=customized_collate_fn,
+    shuffle=False,
+    drop_last=False,
+    num_workers=0,
+)
+
+test_loader = DataLoader(
+    InstructionDataset(test_data, tokenizer),
+    batch_size=8,
+    collate_fn=customized_collate_fn,
+    shuffle=False,
+    drop_last=False,
+    num_workers=0,
+)
+```
+
+Padding is dynamic per batch, so different batches may have different sequence lengths. Within one batch, however, inputs and targets are rectangular tensors with identical shapes.
+
+## 9. Loading GPT-2 medium
+
+The notebook chooses GPT-2 medium rather than the smaller model used in earlier demonstrations:
+
+```python
+from GPTmodel import GPTModel, load_weights_into_gpt
+from gpt_download import download_and_load_gpt2
+
+base_config = {
+    "vocab_size": 50257,
+    "context_length": 1024,
+    "drop_rate": 0.0,
+    "qkv_bias": True,
+}
+
+model_configs = {
+    "gpt2-small (124M)": {
+        "emb_dim": 768,
+        "n_layers": 12,
+        "n_heads": 12,
+    },
+    "gpt2-medium (355M)": {
+        "emb_dim": 1024,
+        "n_layers": 24,
+        "n_heads": 16,
+    },
+}
+
+choose_model = "gpt2-medium (355M)"
+base_config.update(model_configs[choose_model])
+
+model_size = (
+    choose_model.split(" ")[-1]
+    .lstrip("(")
+    .rstrip(")")
+)
+settings, params = download_and_load_gpt2(
+    model_size=model_size,
+    models_dir="gpt2",
+)
+
+model = GPTModel(base_config)
+load_weights_into_gpt(model, params)
+```
+
+GPT-2 medium has an embedding dimension of 1,024, 24 Transformer blocks, and 16 attention heads.
+
+Unlike Chapter 6 classification, the output head is not replaced. The task still requires vocabulary logits because the answer is generated token by token.
+
+## 10. Establishing a pretrained baseline
+
+Before fine-tuning, the notebook asks the pretrained model to convert an active sentence to passive voice. The model mostly repeats the sentence and begins another instruction instead of following the requested transformation.
+
+This baseline is important. GPT-2 already knows language, but ordinary pretraining did not consistently teach it the specific prompt template or the behavior “follow this instruction and answer here.”
+
+The response is extracted by removing the prompt prefix:
+
+```python
+input_text = format_input(val_data[0])
+generated_text = token_ids_to_text(token_ids, tokenizer)
+response_text = generated_text[len(input_text) :].strip()
+```
+
+String slicing works because `generated_text` begins with the exact decoded prompt. Production code should verify this assumption and parse delimiters defensively.
+
+## 11. Instruction fine-tuning
+
+The training loop from Chapter 5 can be reused because both tasks optimize next-token cross-entropy:
+
+```python
+model.to(device)
+torch.manual_seed(123)
+
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=0.00005,
+    weight_decay=0.1,
+)
+
+train_losses, val_losses, tokens_seen = train_model_simple(
+    model,
+    train_loader,
+    val_loader,
+    optimizer,
+    device,
+    num_epochs=2,
+    eval_freq=5,
+    eval_iter=5,
+    start_context=format_input(val_data[0]),
+    tokenizer=tokenizer,
+)
+```
+
+All model parameters remain trainable in this notebook. The small learning rate helps avoid changing the pretrained weights too abruptly.
+
+The initial sampled evaluation showed training and validation losses near 2.64. They fell rapidly during the first epoch, while the generated example changed from copying the active sentence to a valid passive construction:
+
+> The meal is prepared every day by the chef.
+
+This result indicates that the model learned both the response format and the task-following behavior represented in the dataset.
+
+## 12. Generating held-out responses
+
+The notebook first inspects a few test examples manually:
+
+```python
+for entry in test_data[:3]:
+    input_text = format_input(entry)
+    token_ids = generate(
+        model=model,
+        idx=text_to_token_ids(
+            input_text,
+            tokenizer,
+        ).to(device),
+        max_new_tokens=256,
+        context_size=base_config["context_length"],
+        eos_id=50256,
+    )
+
+    generated_text = token_ids_to_text(
+        token_ids,
+        tokenizer,
+    )
+    response_text = (
+        generated_text[len(input_text) :]
+        .replace("### Response:", "")
+        .strip()
+    )
+```
+
+One reference says “as fast as lightning,” while the model answers “as fast as a bullet.” The wording differs, but both satisfy the request for a simile. This illustrates why exact string matching is a poor metric for open-ended generation.
+
+Another answer confuses cumulonimbus with cumulus, showing that fluent form does not guarantee factual correctness.
+
+## 13. Saving responses and the model
+
+The full test set is augmented with a `model_response` field and saved as JSON:
+
+```python
+for i, entry in enumerate(test_data):
+    # Generate response_text...
+    test_data[i]["model_response"] = response_text
+
+with open(
+    "instruction-data-with-response.json",
+    "w",
+    encoding="utf-8",
+) as file:
+    json.dump(
+        test_data,
+        file,
+        indent=4,
+        ensure_ascii=False,
+    )
+```
+
+The model checkpoint name is derived from the selected model:
+
+```python
+import re
+
+file_name = (
+    f"{re.sub(r'[ ()]', '', choose_model)}-sft.pth"
+)
+torch.save(model.state_dict(), file_name)
+# gpt2-medium355M-sft.pth
+```
+
+The regular expression removes spaces and parentheses. As in earlier chapters, restoring the checkpoint also requires the matching model configuration and preprocessing/template conventions.
+
+## 14. Why response evaluation is difficult
+
+Classification has a small fixed label set. Instruction responses can be correct in many different ways, so evaluation may involve:
+
+- exact or normalized matching for tasks with one unambiguous answer;
+- task-specific tests, such as executing generated code;
+- human review for correctness, relevance, clarity, and safety;
+- model-based scoring for faster approximate evaluation.
+
+No single metric captures all forms of instruction following.
+
+## 15. Using a local LLM as a judge
+
+The notebook queries a local Llama 3 model through Ollama’s HTTP API:
+
+```python
+def query_model(
+    prompt,
+    model="llama3",
+    url="http://localhost:11434/api/chat",
+):
+    data = {
+        "model": model,
+        "messages": [
+            {"role": "user", "content": prompt},
+        ],
+        "options": {
+            "seed": 123,
+            "temperature": 0,
+            "num_ctx": 2048,
+        },
+    }
+
+    payload = json.dumps(data).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+
+    response_text = ""
+    with urllib.request.urlopen(request) as response:
+        for line in response:
+            response_json = json.loads(line.decode("utf-8"))
+            response_text += response_json["message"]["content"]
+
+    return response_text
+```
+
+Temperature 0 and a fixed seed improve reproducibility. The endpoint streams JSON lines, so the function concatenates the `message.content` fragment from each line.
+
+Each test entry is turned into a grading prompt:
+
+```python
+def generate_model_scores(
+    json_data,
+    json_key,
+    model="llama3",
+):
+    scores = []
+
+    for entry in json_data:
+        prompt = (
+            f"Given the input {format_input(entry)!r} "
+            f"and correct output {entry['output']!r}, "
+            f"score the model response {entry[json_key]!r} "
+            "on a scale from 0 to 100, where 100 is best. "
+            "Respond with the integer number only."
+        )
+
+        score = query_model(prompt, model)
+        try:
+            scores.append(int(score))
+        except ValueError:
+            print(f"Could not convert score: {score}")
+
+    return scores
+```
+
+The notebook obtained 110 scores with an average of 47.65.
+
+That number is useful for comparing experiments that use the same judge and rubric, but it is not an objective measure of quality. An LLM judge can be biased by phrasing, verbosity, answer order, prompt injection inside evaluated text, and its own factual errors. A stronger evaluation would use a detailed rubric, validate score parsing, inspect score distributions, and retain human spot checks.
+
+## 16. How Chapter 7 differs from Chapters 5 and 6
+
+| Aspect         | Pretraining         | Classification fine-tuning | Instruction fine-tuning         |
+| -------------- | ------------------- | -------------------------- | ------------------------------- |
+| Input          | ordinary text       | one SMS message            | instruction + optional input    |
+| Target         | next token          | one class label            | desired response tokens         |
+| Output head    | vocabulary          | two classes                | vocabulary                      |
+| Loss positions | text tokens         | final sequence position    | non-padding sequence tokens     |
+| Result         | base language model | spam classifier            | instruction-following generator |
+| Evaluation     | loss and samples    | accuracy                   | response quality                |
+
+Instruction tuning does not replace next-token prediction. It arranges supervised examples so that next-token prediction teaches a conversational behavior.
+
+## 17. Final understanding
+
+My main takeaways are:
+
+1. Prompt templates convert structured instruction records into a consistent language-model sequence.
+2. Inputs and targets are still created by shifting the same token sequence by one position.
+3. Dynamic batch padding reduces wasted computation compared with one dataset-wide maximum.
+4. One EOT target teaches stopping, while `-100` removes repeated padding from cross-entropy.
+5. Pretrained GPT-2 can generate language but does not reliably follow a new instruction format before fine-tuning.
+6. Instruction tuning can reuse the same model architecture, vocabulary head, and training loop as pretraining.
+7. Open-ended answers require semantic evaluation rather than exact string equality.
+8. LLM-as-judge is scalable but approximate, so its rubric, model, settings, and limitations must be documented.
+
+Across Chapters 2–7, the complete path is now:
+
+```text
+text → tokens → attention → GPT
+  → pretraining → pretrained weights
+  → classification fine-tuning
+  → instruction fine-tuning
+  → response evaluation
+```
+
+## References
+
+- [Build a Large Language Model (From Scratch)](https://www.manning.com/books/build-a-large-language-model-from-scratch)
+- [Official LLMs-from-scratch GitHub repository](https://github.com/rasbt/LLMs-from-scratch)
+- [Official Chapter 7 notebook](https://github.com/rasbt/LLMs-from-scratch/blob/main/ch07/01_main-chapter-code/ch07.ipynb)
+- [PyTorch DataLoader documentation](https://pytorch.org/docs/stable/data.html)
+- [PyTorch cross-entropy documentation](https://pytorch.org/docs/stable/generated/torch.nn.functional.cross_entropy.html)
+- [Ollama API documentation](https://github.com/ollama/ollama/blob/main/docs/api.md)
