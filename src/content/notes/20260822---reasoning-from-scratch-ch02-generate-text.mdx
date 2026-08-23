@@ -1,0 +1,450 @@
+---
+title: '使用预训练 Qwen3 生成文本：Reasoning from Scratch 第 2 章笔记'
+description: '逐行梳理 Qwen3 0.6B 的加载、greedy streaming decoding、KV cache，以及 CPU/GPU 生成计时。'
+date: 2026-08-23
+tags:
+  - reasoning-models
+  - llm
+  - pytorch
+  - qwen3
+  - book-notes
+language: 'zh-CN'
+type: note
+status: in-progress
+draft: false
+---
+
+> **来源与翻译说明**
+>
+> 本文是我学习 Sebastian Raschka 的 _Build a Reasoning Model (From Scratch)_ 第 2 章时所做的
+> 笔记。代码来自我的章节 Notebook，并参考本书的
+> [官方配套仓库](https://github.com/rasbt/reasoning-from-scratch)；代码版权归原作者所有，并遵循该
+> 仓库的许可证。本文首先以英文写成，中文版本由 Codex 辅助翻译。Codex 也根据我的英文 Notebook
+> 生成了这份初稿。本文只是我对学习过程的解释性记录，不能替代原书。
+
+第 2 章搭建了后续章节都会使用的 inference path：下载一个小型的预训练 Qwen3 模型，把 prompt
+转换为 token ID，逐 token 生成文本，再用 key-value cache 改进生成循环。Notebook 最后还在 CPU
+和 CUDA 上运行相同任务并比较速度。
+
+```text
+prompt
+  → tokenizer
+  → token IDs
+  → pretrained Qwen3
+  → next-token logits
+  → greedy token selection
+  → streamed text
+```
+
+## 1. 导入 Qwen3 工具
+
+```python
+import torch
+from reasoning_from_scratch.qwen3 import (
+    download_qwen3_small,
+    Qwen3Tokenizer,
+)
+```
+
+- `import torch` 提供 tensor、device 管理、模型加载和 inference 工具。
+- `download_qwen3_small` 下载本章所需的 tokenizer 或模型文件。
+- `Qwen3Tokenizer` 在文本和 Qwen3 所使用的整数 token ID 之间转换。
+- 括号包裹的写法可以把多个导入项清楚地分到多行。
+
+首先只下载 tokenizer，暂时不下载模型权重：
+
+```python
+download_qwen3_small(kind="base", tokenizer_only=True, out_dir = "qwen3")
+```
+
+- `kind="base"` 选择 base model，而不是经过 reasoning tuning 的模型。
+- `tokenizer_only=True` 将这次下载限制为 tokenizer 相关文件。
+- `out_dir = "qwen3"` 把文件保存在本地 `qwen3` 目录中。
+
+接着，Notebook 从下载的 JSON 文件构造 tokenizer：
+
+```python
+from pathlib import Path
+tokenizer_path = Path("qwen3") / "tokenizer-base.json"
+tokenizer = Qwen3Tokenizer(tokenizer_file_path=tokenizer_path)
+```
+
+- `Path` 用对象表示文件系统路径，不需要手动处理不同操作系统的路径分隔符。
+- `/` 运算符把目录和文件名组合成当前平台上的 `qwen3/tokenizer-base.json`。
+- `Qwen3Tokenizer(...)` 加载 vocabulary 和相应的 tokenization rules。
+
+## 2. 选择计算设备
+
+下面的函数依次检测多种 accelerator backend，并可以在兼容的 NVIDIA GPU 上启用
+TensorFloat-32：
+
+```python
+def get_device(enable_tensor_cores=True):
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print("Using NVIDIA CUDA GPU")
+
+        if enable_tensor_cores:
+            major, minor = map(int, torch.__version__.split(".")[:2])
+            # torch.__version__ is lke "2.10.0+cu126"
+            if (major, minor) >= (2, 11):
+                # New API
+                torch.backends.cuda.matmul.fp32_precision = "tf32"
+                torch.backends.cudnn.conv.fp32_precision = "tf32"
+            else:
+                # Legacy API
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("Using Apple Silicon GPU (MPS)")
+    elif torch.xpu.is_available():
+        device = torch.device("xpu")
+        print("Using Intel GPU")
+    else:
+        device = torch.device("cpu")
+        print("Using CPU")
+
+    return device
+```
+
+这个函数从加速设备依次走向通用 fallback：
+
+1. `torch.cuda.is_available()` 检查 NVIDIA CUDA 设备。
+2. 如果允许使用 tensor core，就拆分 PyTorch 版本字符串，并把 major、minor version 转成整数。
+3. PyTorch 2.11 及以上版本使用新的 `fp32_precision` 设置；旧版本使用 legacy
+   `allow_tf32` flags。
+4. 如果没有 CUDA，就继续检查 Apple MPS，然后检查 Intel XPU。
+5. 如果没有任何 accelerator，最终返回 CPU device。
+
+```python
+device = get_device()
+```
+
+在运行这份 Notebook 的机器上，该调用输出 `Using NVIDIA CUDA GPU`。不过本章先主动使用 CPU，
+以便得到容易运行和比较的 baseline：
+
+```python
+device = torch.device("cpu")
+```
+
+这次显式赋值会在下一节中覆盖刚刚检测到的 CUDA device。
+
+## 3. 加载预训练 Qwen3 0.6B 模型
+
+第二次下载包含 base model 的权重：
+
+```python
+download_qwen3_small(kind="base", tokenizer_only=False, out_dir="qwen3")
+```
+
+这里的 `tokenizer_only=False` 表示除了 tokenizer，也要确保本地存在模型 checkpoint。如果本地
+文件已经是最新版本，下载函数可以直接复用它。
+
+```python
+from reasoning_from_scratch.qwen3 import Qwen3Model, QWEN_CONFIG_06_B
+
+model_path = Path("qwen3")/ "qwen3-0.6B-base.pth"
+model = Qwen3Model(QWEN_CONFIG_06_B)
+model.load_state_dict(torch.load(model_path))
+model.to(device)
+```
+
+- `QWEN_CONFIG_06_B` 描述 0.6B 参数模型的架构。
+- `Qwen3Model(...)` 先在内存中创建这一架构。
+- `torch.load(model_path)` 读取序列化后的参数 tensor。
+- `load_state_dict(...)` 把这些 tensor 映射到对应的模型层。
+- `model.to(device)` 把所有参数移到上面选定的 CPU。
+
+打印出的架构包含 28 个 transformer block。与前面的 GPT 实现相比，这里有两个新组件：
+`GroupedQueryAttention` 和 `RMSNorm`。前者让多组 query head 共享 key/value head；后者根据 activation
+的 root-mean-square magnitude 进行缩放。
+
+## 4. 以 greedy decoding 流式生成文本
+
+第一个 generator 每一步都会重新计算完整序列。它刻意保持简单，让 shape 变化和控制流程都能直接
+看到：
+
+```python
+@torch.inference_mode()
+def generate_text_basic_stream(model, token_ids, max_new_tokens, eos_token_id=None):
+    model.eval()
+
+    for _ in range(max_new_tokens):
+        out = model(token_ids)[:, -1]
+        next_token = torch.argmax(out, dim = -1, keepdim=True)
+
+        if (eos_token_id is not None and torch.all(next_token == eos_token_id)):
+            break
+        yield next_token
+
+        token_ids = torch.cat([token_ids, next_token], dim = 1)
+```
+
+逐行来看，这个函数完成了以下工作：
+
+- `@torch.inference_mode()` 关闭 gradient recording，因为生成过程不会训练模型，从而减少内存和额外
+  bookkeeping。
+- `model.eval()` 把 dropout 等与训练状态有关的行为切换到 evaluation mode。
+- `range(max_new_tokens)` 为新生成的 token 数量设置硬上限。
+- `model(token_ids)` 返回 shape 为 `(batch_size, sequence_length, vocabulary_size)` 的 logits。
+- `[:, -1]` 保留所有 batch item，但只取最后一个 sequence position，得到
+  `(batch_size, vocabulary_size)`。
+- `torch.argmax(..., dim=-1)` 选择 logit 最大的 vocabulary ID。这是 greedy decoding，而不是概率
+  sampling。
+- `keepdim=True` 保留最后一个维度，使结果 shape 为 `(batch_size, 1)`，方便后续拼接。
+- EOS 条件只有在传入 EOS ID，并且 batch 中每个序列都预测 EOS 时才停止。
+- `yield next_token` 把一个 token 交给调用方，并暂停 generator。
+- 恢复执行后，`torch.cat(..., dim=1)` 沿 sequence dimension 追加该 token。
+
+### `yield` 如何控制执行
+
+因为函数中含有 `yield`，调用函数时不会立刻执行函数体，而是先创建一个 generator object。调用方
+可以这样消费它：
+
+```python
+for next_token in generate_text_basic_stream(model, token_ids, max_new_tokens):
+    print(next_token)
+```
+
+调用方每轮循环请求一个值。函数执行到 `yield next_token` 时把 token 返回，然后保留所有局部状态并
+暂停。调用方请求下一个值时，函数从 `yield` 后继续执行，追加刚才的 token，再开始下一轮预测：
+
+```text
+predict token → yield token → pause → resume → append token → predict next token
+```
+
+EOS 检查发生在 `yield` 之前，因此结束 batch 的 EOS token 既不会被 yield，也不会被追加。如果调用
+方提前停止消费 generator，最近一次 `yield` 后面的代码不一定会运行。
+
+## 5. 记录速度与显存统计
+
+下面的 helper 输出运行时间、token throughput 和 accelerator peak memory：
+
+```python
+import warnings
+def generate_stats(output_token_ids, tokenizer, start_time, end_time):
+    total_time = end_time - start_time
+    print(f"\n\nTime: {total_time:.2f} sec")
+    print(f"{int(output_token_ids.numel() / total_time)} tokens/sec")
+
+    for name, backend in (("CUDA", getattr(torch, "cuda", None)),
+                          ("XPU", getattr(torch, "xpu", None))):
+        if backend is not None and backend.is_available():
+
+            device_type = output_token_ids.device.type
+            if device_type != name.lower():
+                warnings.warn(
+                    f"{name} is available but tensors are on"
+                    f"{device_type}. Memory stats may be 0"
+                )
+            if hasattr(backend, "synchronize"):
+                backend.synchronize()
+            max_mem_bytes = backend.max_memory_allocated()
+            max_mem_gb = max_mem_bytes / (1024 ** 3)
+            print(f"Max {name} memory allocated: {max_mem_gb:2f} GB")
+            backend.reset_peak_memory_stats()
+```
+
+- `end_time - start_time` 计算 wall-clock duration。
+- `output_token_ids.numel()` 统计生成的 token ID 数量；除以运行时间就得到 tokens per second。
+- tuple loop 用同一段逻辑处理 CUDA 和 XPU。
+- `getattr(torch, ..., None)` 避免假设所有 PyTorch build 都提供每种 backend。
+- 如果 accelerator 可用，但输出 tensor 在另一个 device 上，函数会发出 warning；此时显存数字不能
+  描述当前 generation run。
+- synchronization 会在读取统计前等待排队中的 accelerator operation 完成。
+- byte 数除以 `1024 ** 3` 后，以接近 GiB 的单位展示。
+- `reset_peak_memory_stats()` 清空 peak counter，供下一轮运行重新统计。
+
+这个版本的函数没有实际使用 `tokenizer` 参数。Notebook 保留了该参数，以后可以继续加入与 decoded
+output 有关的统计。
+
+## 6. 加入 KV cache
+
+```python
+from reasoning_from_scratch.qwen3 import KVCache
+```
+
+Autoregressive generation 会不断重新关注同一个 prompt 和已经生成的 token。如果没有 cache，模型每
+一步都要为越来越长的完整序列重新计算 key 和 value。`KVCache` 会保存这些 attention tensor，并在
+后续步骤中复用。
+
+```python
+@torch.inference_mode()
+def generate_text_basic_stream_cache(model, token_ids,
+                                     max_new_tokens, eos_token_id=None):
+    model.eval()
+    cache = KVCache(n_layers=model.cfg["n_layers"])
+    model.reset_kv_cache()
+
+    out = model(token_ids, cache=cache)[:, -1]
+    for _ in range(max_new_tokens):
+        next_token = torch.argmax(out, dim = -1, keepdim=True)
+
+        if (eos_token_id is not None and torch.all(next_token == eos_token_id)):
+            break
+        yield next_token
+        out = model(next_token, cache=cache)[:, -1]
+
+
+```
+
+关键变化是把 initial prompt pass 和后续 one-token pass 分开：
+
+1. `KVCache(n_layers=...)` 为每个 transformer layer 创建 cache storage。
+2. `model.reset_kv_cache()` 清除上一次生成可能留下的状态。
+3. `model(token_ids, cache=cache)` 只完整处理 prompt 一次，同时填充 cache。
+4. 循环和之前一样，以 greedy 方式选择并 yield 下一个 token。
+5. `model(next_token, cache=cache)` 之后只处理刚刚生成的 token；更早的 context 由缓存中的 key 和
+   value 提供。
+
+逻辑上的上下文没有变化，但模型不必在每轮迭代中再次接收完整 token tensor。
+
+## 7. Model compilation 占位代码
+
+Notebook 记录了一段依赖 PyTorch 版本的 `torch.compile` 设置，但把所有代码留在注释状态：
+
+```python
+# major, minor = map(int, torch.__version__.split(".")[:2])
+# if (major, minor) >= (2, 8):
+#     torch._dynamo.config.allow_unspec_int_on_nn_module = True
+
+# # model_compiled = torch.compile(model)
+# model_compiled = model
+```
+
+因为每一行都被注释，这个 cell 不会修改模型。它只是标记了启用 compilation 的位置，以及如何用原始
+模型作为 fallback。因此下面实际计时的是使用 KV cache、但未主动 compile 的模型。
+
+## 8. 在 CPU 上为 cached generation 计时
+
+```python
+prompt = "Explain large language models in a single sentence."
+input_token_ids_tensor = torch.tensor(tokenizer.encode(prompt),
+                                      device=device).unsqueeze(0)
+max_new_tokens = 100
+
+import time
+for i in range(3):
+    start_time = time.time()
+    generated_ids = []
+
+    for token in generate_text_basic_stream_cache(model=model,
+                                                  token_ids = input_token_ids_tensor,
+                                                  max_new_tokens=max_new_tokens,
+                                                  eos_token_id=tokenizer.eos_token_id):
+        token_id = token.squeeze(0).tolist()
+        print(
+            tokenizer.decode(token_id),
+            end="",
+            flush=True
+        )
+        next_token_id = token.squeeze(0)
+        generated_ids.append(next_token_id)
+    end_time = time.time()
+
+    if i == 0:
+        print("\n\nWarm-up run")
+    else:
+        print(f"\n\nTimed run {i}:")
+
+    output_token_ids_tensor = torch.cat(generated_ids, dim=0)
+    generate_stats(
+        output_token_ids_tensor, tokenizer, start_time, end_time
+    )
+    print(f"\n{30 * '-'}\n")
+```
+
+这个 cell 把前面的组件连接起来：
+
+- `tokenizer.encode(prompt)` 生成一维 ID list。
+- `torch.tensor(..., device=device)` 直接把 ID 放到选定的 device 上。
+- `.unsqueeze(0)` 添加 batch dimension，把 shape 从 `(sequence_length,)` 变成
+  `(1, sequence_length)`。
+- 三次运行把第一次明确作为 warm-up，并留下两次计时结果用于比较。
+- yield 的每个 token shape 为 `(1, 1)`。第一个 `squeeze(0)` 删除 batch dimension，`.tolist()`
+  再把它转成 Python list 供 tokenizer 解码。
+- `end=""` 避免每个 token 后自动换行；`flush=True` 让 token 立即显示出来。
+- tensor 形式的 token 被加入 `generated_ids`，最后通过 `torch.cat(..., dim=0)` 组成 statistics
+  helper 所需的输出 tensor。
+
+这份 Notebook 的 CPU 运行每次都生成相同句子，速度约为 14 tokens/s。由于 CUDA 此时可用，但
+tensor 仍在 CPU，helper 也提示 CUDA memory statistics 可能为零。
+
+## 9. 在 CUDA 上重复 benchmark
+
+首先重新选择检测到的 accelerator：
+
+```python
+device = get_device()
+```
+
+在学习时使用的机器上，它返回 CUDA。模型和已有的 input tensor 必须一起移动到同一个 device：
+
+```python
+
+
+model_cuda = model.to(device)
+input_token_ids_tensor = input_token_ids_tensor.to(device)
+
+for i in range(3):
+    torch.cuda.synchronize()
+    start_time = time.perf_counter()
+
+    generated_ids = []
+
+    for token in generate_text_basic_stream_cache(
+        model=model_cuda,
+        token_ids=input_token_ids_tensor,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=tokenizer.eos_token_id,
+    ):
+        token_id = token.squeeze(0).tolist()
+        print(tokenizer.decode(token_id), end="", flush=True)
+        generated_ids.append(token.squeeze(0))
+
+    torch.cuda.synchronize()
+    end_time = time.perf_counter()
+
+    if i == 0:
+            print("\n\nWarm-up run")
+    else:
+        print(f"\n\nTimed run {i}:")
+
+    output_token_ids_tensor = torch.cat(generated_ids, dim=0)
+    generate_stats(
+        output_token_ids_tensor, tokenizer, start_time, end_time
+        )
+    print(f"\n{30 * '-'}\n")
+```
+
+- `model.to(device)` 和 `input_token_ids_tensor.to(device)` 防止模型参数与输入数据位于不同 device。
+- 计时前的 `torch.cuda.synchronize()` 等待更早提交的 GPU 工作完成。
+- `time.perf_counter()` 提供高精度的 elapsed-time clock。
+- 读取 `end_time` 前再次同步非常重要，因为 CUDA 异步提交工作；否则计时可能在 GPU 真正完成前
+  结束。
+- 其余 generation、decoding、collection 和 statistics 步骤都与 CPU loop 对应。
+
+在这份 Notebook 中，第一次 CUDA run 约为 1.77 秒；之后两次 timed run 约为 1.39 秒和 1.42 秒，
+即 29 和 28 tokens/s，peak allocated CUDA memory 约为 1.45 GB。这些数值只描述一台机器和一组
+software configuration；真正可复用的是同步后再测量的方法，而不是绝对数字。
+
+## 10. 本章建立的基础
+
+本章最终得到了一条可复用的 inference pipeline：
+
+```text
+download assets
+  → construct tokenizer and model
+  → load pretrained weights
+  → choose a device
+  → encode a batched prompt
+  → prefill the KV cache
+  → decode and stream one token at a time
+  → measure synchronized execution
+```
+
+基础 generator 让 autoregressive decoding 的每一步都容易检查。cached generator 保留相同输出
+行为，同时避免反复计算完整上下文。第 3 章会直接复用这个 cached streaming function 来评估
+reasoning model。
