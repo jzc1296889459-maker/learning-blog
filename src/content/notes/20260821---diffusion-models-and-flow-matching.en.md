@@ -2,6 +2,7 @@
 title: 'Diffusion Models and Flow Matching'
 description: 'A mathematical foundation for diffusion models and flow matching, from probability and path-space measures to ODEs, SDEs, and score matching.'
 date: 2026-08-21
+updatedDate: 2026-08-23
 tags:
   - diffusion-models
   - flow-matching
@@ -1374,8 +1375,8 @@ or inserted into the score-corrected SDE for stochastic sampling.
 
 ## Source
 
-These notes follow Sections 1-4 and Appendix A of Peter Holderrieth and Ezra Erives,
-*An Introduction to Flow Matching and Diffusion Models*, MIT 6.S184 (2026), with additional
-measure-theoretic clarification and an explicit probability/SDE preliminaries section.
-
-
+These notes follow Sections 1–4 and Appendix A of Peter Holderrieth and Ezra Erives,
+[_An Introduction to Flow Matching and Diffusion Models_](https://diffusion.csail.mit.edu/docs/lecture-notes.pdf),
+MIT 6.S184 lecture notes (2026; [course page](https://diffusion.csail.mit.edu/2026/),
+[arXiv:2506.02070](https://arxiv.org/abs/2506.02070)), with additional measure-theoretic
+clarification and an explicit probability/SDE preliminaries section.

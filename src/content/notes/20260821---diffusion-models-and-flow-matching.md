@@ -2,6 +2,7 @@
 title: '扩散模型与流匹配'
 description: '扩散模型与流匹配的数学基础：从概率、路径空间测度到 ODE、SDE 与分数匹配。'
 date: 2026-08-21
+updatedDate: 2026-08-23
 tags:
   - diffusion-models
   - flow-matching
@@ -1339,6 +1340,8 @@ SDE 中进行随机采样。
 
 ## 来源
 
-本笔记主要依据 Peter Holderrieth 与 Ezra Erives 的 MIT 6.S184（2026）课程材料
-*An Introduction to Flow Matching and Diffusion Models* 第 1–4 节及附录 A，并补充了测度论层面的
-说明以及明确的概率论与 SDE 预备知识。
+本笔记主要依据 Peter Holderrieth 与 Ezra Erives 的 MIT 6.S184（2026）课程讲义
+[_An Introduction to Flow Matching and Diffusion Models_](https://diffusion.csail.mit.edu/docs/lecture-notes.pdf)
+第 1–4 节及附录 A（另见[课程主页](https://diffusion.csail.mit.edu/2026/)与
+[arXiv:2506.02070](https://arxiv.org/abs/2506.02070)），并补充了测度论层面的说明以及明确的
+概率论与 SDE 预备知识。
