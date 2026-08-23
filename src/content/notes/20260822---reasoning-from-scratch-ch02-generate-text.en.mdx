@@ -1,0 +1,469 @@
+---
+title: 'Generating Text with a Pretrained Qwen3 Model: Chapter 2 Study Notes'
+description: 'A line-by-line walkthrough of loading Qwen3 0.6B, streaming greedy decoding, KV caching, and CPU/GPU generation timing.'
+date: 2026-08-23
+tags:
+  - reasoning-models
+  - llm
+  - pytorch
+  - qwen3
+  - book-notes
+language: 'en'
+translationKey: '20260822---reasoning-from-scratch-ch02-generate-text'
+type: note
+status: in-progress
+draft: false
+---
+
+> **Source note**
+>
+> This is my study note for Chapter 2 of Sebastian Raschka's _Build a Reasoning Model
+> (From Scratch)_. The code follows my chapter notebook and the book's
+> [official companion repository](https://github.com/rasbt/reasoning-from-scratch). The code
+> remains the author's work under the repository's license. Codex generated this first draft from
+> my English notebook; the Chinese version is a Codex-assisted translation. This note is an
+> explanatory record of my study and does not replace the book.
+
+Chapter 2 establishes the inference path used throughout the rest of the project. It downloads a
+small pretrained Qwen3 model, converts a prompt into token IDs, generates one token at a time, and
+then improves the loop with a key-value cache. The notebook finishes by timing the same workload on
+CPU and CUDA.
+
+```text
+prompt
+  → tokenizer
+  → token IDs
+  → pretrained Qwen3
+  → next-token logits
+  → greedy token selection
+  → streamed text
+```
+
+## 1. Importing the Qwen3 utilities
+
+```python
+import torch
+from reasoning_from_scratch.qwen3 import (
+    download_qwen3_small,
+    Qwen3Tokenizer,
+)
+```
+
+- `import torch` provides tensors, device management, model loading, and inference utilities.
+- `download_qwen3_small` downloads the tokenizer or model files needed by this chapter.
+- `Qwen3Tokenizer` converts between text and the integer token IDs understood by Qwen3.
+- The parenthesized import keeps several names readable across multiple lines.
+
+The tokenizer is downloaded first, without downloading the model weights yet:
+
+```python
+download_qwen3_small(kind="base", tokenizer_only=True, out_dir = "qwen3")
+```
+
+- `kind="base"` chooses the base model rather than a reasoning-tuned model.
+- `tokenizer_only=True` limits this call to tokenizer assets.
+- `out_dir = "qwen3"` stores those assets in a local `qwen3` directory.
+
+Next, the notebook constructs the tokenizer from the downloaded JSON file:
+
+```python
+from pathlib import Path
+tokenizer_path = Path("qwen3") / "tokenizer-base.json"
+tokenizer = Qwen3Tokenizer(tokenizer_file_path=tokenizer_path)
+```
+
+- `Path` represents filesystem paths without manual slash handling.
+- The `/` operator joins the directory and filename into `qwen3/tokenizer-base.json` on the current
+  platform.
+- `Qwen3Tokenizer(...)` loads that vocabulary and its tokenization rules.
+
+## 2. Selecting a compute device
+
+The helper below detects several accelerator backends and optionally enables TensorFloat-32 on
+compatible NVIDIA GPUs:
+
+```python
+def get_device(enable_tensor_cores=True):
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print("Using NVIDIA CUDA GPU")
+
+        if enable_tensor_cores:
+            major, minor = map(int, torch.__version__.split(".")[:2])
+            # torch.__version__ is lke "2.10.0+cu126"
+            if (major, minor) >= (2, 11):
+                # New API
+                torch.backends.cuda.matmul.fp32_precision = "tf32"
+                torch.backends.cudnn.conv.fp32_precision = "tf32"
+            else:
+                # Legacy API
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("Using Apple Silicon GPU (MPS)")
+    elif torch.xpu.is_available():
+        device = torch.device("xpu")
+        print("Using Intel GPU")
+    else:
+        device = torch.device("cpu")
+        print("Using CPU")
+
+    return device
+```
+
+The function works from the most specific accelerated option to the universal fallback:
+
+1. `torch.cuda.is_available()` checks for an NVIDIA CUDA device.
+2. When tensor cores are enabled, the PyTorch version string is split and its major and minor
+   numbers are converted to integers.
+3. PyTorch 2.11 and later use the newer `fp32_precision` settings; earlier versions use the legacy
+   `allow_tf32` flags.
+4. If CUDA is absent, the function checks Apple's MPS backend and then Intel's XPU backend.
+5. If no accelerator is available, it returns a CPU device.
+
+```python
+device = get_device()
+```
+
+On the machine used for this notebook, the call printed `Using NVIDIA CUDA GPU`. The chapter first
+uses the CPU deliberately, however, so that the baseline is easy to run and compare:
+
+```python
+device = torch.device("cpu")
+```
+
+This explicit assignment replaces the detected CUDA device for the next section.
+
+## 3. Loading the pretrained Qwen3 0.6B model
+
+The second download includes the base model weights:
+
+```python
+download_qwen3_small(kind="base", tokenizer_only=False, out_dir="qwen3")
+```
+
+Here, `tokenizer_only=False` tells the helper to ensure the model checkpoint is present as well.
+The downloader can reuse an up-to-date local file instead of downloading it again.
+
+```python
+from reasoning_from_scratch.qwen3 import Qwen3Model, QWEN_CONFIG_06_B
+
+model_path = Path("qwen3")/ "qwen3-0.6B-base.pth"
+model = Qwen3Model(QWEN_CONFIG_06_B)
+model.load_state_dict(torch.load(model_path))
+model.to(device)
+```
+
+- `QWEN_CONFIG_06_B` describes the 0.6-billion-parameter architecture.
+- `Qwen3Model(...)` first creates that architecture in memory.
+- `torch.load(model_path)` reads the serialized parameter tensors.
+- `load_state_dict(...)` maps those tensors into their corresponding model layers.
+- `model.to(device)` moves all parameters to the CPU selected above.
+
+The printed architecture shows 28 transformer blocks. Two components that differ from the earlier
+GPT implementation are `GroupedQueryAttention` and `RMSNorm`: grouped-query attention shares
+key/value heads across groups of query heads, while RMS normalization rescales activations using
+their root-mean-square magnitude.
+
+## 4. Streaming greedy text generation
+
+The first generator recomputes the full sequence at every step. It is intentionally simple, making
+the shape changes and control flow visible:
+
+```python
+@torch.inference_mode()
+def generate_text_basic_stream(model, token_ids, max_new_tokens, eos_token_id=None):
+    model.eval()
+
+    for _ in range(max_new_tokens):
+        out = model(token_ids)[:, -1]
+        next_token = torch.argmax(out, dim = -1, keepdim=True)
+
+        if (eos_token_id is not None and torch.all(next_token == eos_token_id)):
+            break
+        yield next_token
+
+        token_ids = torch.cat([token_ids, next_token], dim = 1)
+```
+
+Line by line, the function does the following:
+
+- `@torch.inference_mode()` disables gradient recording because generation does not train the
+  model. This reduces memory use and bookkeeping.
+- `model.eval()` switches dropout and other training-dependent behavior into evaluation mode.
+- `range(max_new_tokens)` sets a hard upper bound on the number of generated tokens.
+- `model(token_ids)` returns logits with shape `(batch_size, sequence_length, vocabulary_size)`.
+- `[:, -1]` keeps every batch item but only the final sequence position, leaving
+  `(batch_size, vocabulary_size)`.
+- `torch.argmax(..., dim=-1)` chooses the vocabulary ID with the largest logit. This is greedy
+  decoding rather than probabilistic sampling.
+- `keepdim=True` preserves a one-column tensor with shape `(batch_size, 1)`, which is convenient for
+  concatenation.
+- The EOS condition stops only when an EOS ID was supplied and every sequence in the batch predicts
+  it.
+- `yield next_token` sends one token to the caller and pauses the generator.
+- After execution resumes, `torch.cat(..., dim=1)` appends that token along the sequence dimension.
+
+### How `yield` controls execution
+
+Calling the function does not immediately execute its body because it contains `yield`. The call
+creates a generator object. A caller consumes it like this:
+
+```python
+for next_token in generate_text_basic_stream(model, token_ids, max_new_tokens):
+    print(next_token)
+```
+
+Each caller-side loop iteration requests one value. Execution runs until `yield next_token`, returns
+that token, and pauses with all local state preserved. When the caller requests the following value,
+execution resumes after `yield`, appends the previous token, and starts the next prediction:
+
+```text
+predict token → yield token → pause → resume → append token → predict next token
+```
+
+The EOS check occurs before `yield`, so an EOS token that ends the batch is neither yielded nor
+appended. If the caller stops consuming the generator early, the code after the most recent `yield`
+does not necessarily run.
+
+## 5. Recording speed and memory statistics
+
+The next helper reports elapsed time, token throughput, and peak accelerator memory:
+
+```python
+import warnings
+def generate_stats(output_token_ids, tokenizer, start_time, end_time):
+    total_time = end_time - start_time
+    print(f"\n\nTime: {total_time:.2f} sec")
+    print(f"{int(output_token_ids.numel() / total_time)} tokens/sec")
+
+    for name, backend in (("CUDA", getattr(torch, "cuda", None)),
+                          ("XPU", getattr(torch, "xpu", None))):
+        if backend is not None and backend.is_available():
+
+            device_type = output_token_ids.device.type
+            if device_type != name.lower():
+                warnings.warn(
+                    f"{name} is available but tensors are on"
+                    f"{device_type}. Memory stats may be 0"
+                )
+            if hasattr(backend, "synchronize"):
+                backend.synchronize()
+            max_mem_bytes = backend.max_memory_allocated()
+            max_mem_gb = max_mem_bytes / (1024 ** 3)
+            print(f"Max {name} memory allocated: {max_mem_gb:2f} GB")
+            backend.reset_peak_memory_stats()
+```
+
+- `end_time - start_time` calculates wall-clock duration.
+- `output_token_ids.numel()` counts generated token IDs, so dividing it by duration gives tokens per
+  second.
+- The tuple loop handles CUDA and XPU with the same code.
+- `getattr(torch, ..., None)` avoids assuming that every PyTorch build exposes every backend.
+- A warning is emitted when an accelerator exists but the output tensor is on a different device;
+  in that case the accelerator memory statistic does not describe this generation run.
+- Synchronization waits for queued accelerator operations before reading statistics.
+- Bytes are divided by `1024 ** 3` to report GiB-like units.
+- `reset_peak_memory_stats()` clears the peak counter for the next run.
+
+The `tokenizer` parameter is not used inside this version of the helper. It remains part of the
+notebook code and could support decoded-output statistics in a later revision.
+
+## 6. Adding a KV cache
+
+```python
+from reasoning_from_scratch.qwen3 import KVCache
+```
+
+Autoregressive generation repeatedly attends to the same prompt and previously generated tokens.
+Without caching, the model recomputes keys and values for the full growing sequence at every step.
+`KVCache` stores those attention tensors once and reuses them.
+
+```python
+@torch.inference_mode()
+def generate_text_basic_stream_cache(model, token_ids,
+                                     max_new_tokens, eos_token_id=None):
+    model.eval()
+    cache = KVCache(n_layers=model.cfg["n_layers"])
+    model.reset_kv_cache()
+
+    out = model(token_ids, cache=cache)[:, -1]
+    for _ in range(max_new_tokens):
+        next_token = torch.argmax(out, dim = -1, keepdim=True)
+
+        if (eos_token_id is not None and torch.all(next_token == eos_token_id)):
+            break
+        yield next_token
+        out = model(next_token, cache=cache)[:, -1]
+
+
+```
+
+The important change is the separation between the initial prompt pass and subsequent one-token
+passes:
+
+1. `KVCache(n_layers=...)` creates cache storage for every transformer layer.
+2. `model.reset_kv_cache()` clears any state left by an earlier generation.
+3. `model(token_ids, cache=cache)` processes the entire prompt once and fills the cache.
+4. The loop greedily selects and yields the next token as before.
+5. `model(next_token, cache=cache)` then processes only the newly generated token. Earlier context is
+   supplied by the cached keys and values.
+
+The sequence still has the same logical context, but the model no longer receives the full token
+tensor on every iteration.
+
+## 7. Model compilation placeholder
+
+The notebook records a version-dependent setup for `torch.compile`, but leaves it commented out:
+
+```python
+# major, minor = map(int, torch.__version__.split(".")[:2])
+# if (major, minor) >= (2, 8):
+#     torch._dynamo.config.allow_unspec_int_on_nn_module = True
+
+# # model_compiled = torch.compile(model)
+# model_compiled = model
+```
+
+Because every line is commented, this cell does not change the model. It documents where compilation
+could be enabled and where the uncompiled model can be used as a fallback. The timing cells below
+therefore benchmark KV-cached generation, not an actively compiled model.
+
+## 8. Timing cached generation on the CPU
+
+```python
+prompt = "Explain large language models in a single sentence."
+input_token_ids_tensor = torch.tensor(tokenizer.encode(prompt),
+                                      device=device).unsqueeze(0)
+max_new_tokens = 100
+
+import time
+for i in range(3):
+    start_time = time.time()
+    generated_ids = []
+
+    for token in generate_text_basic_stream_cache(model=model,
+                                                  token_ids = input_token_ids_tensor,
+                                                  max_new_tokens=max_new_tokens,
+                                                  eos_token_id=tokenizer.eos_token_id):
+        token_id = token.squeeze(0).tolist()
+        print(
+            tokenizer.decode(token_id),
+            end="",
+            flush=True
+        )
+        next_token_id = token.squeeze(0)
+        generated_ids.append(next_token_id)
+    end_time = time.time()
+
+    if i == 0:
+        print("\n\nWarm-up run")
+    else:
+        print(f"\n\nTimed run {i}:")
+
+    output_token_ids_tensor = torch.cat(generated_ids, dim=0)
+    generate_stats(
+        output_token_ids_tensor, tokenizer, start_time, end_time
+    )
+    print(f"\n{30 * '-'}\n")
+```
+
+This cell connects every earlier component:
+
+- `tokenizer.encode(prompt)` produces a one-dimensional list of IDs.
+- `torch.tensor(..., device=device)` places the IDs directly on the selected device.
+- `.unsqueeze(0)` adds the batch dimension, changing the shape from `(sequence_length,)` to
+  `(1, sequence_length)`.
+- Three runs make the first iteration an explicit warm-up and leave two timed comparisons.
+- Each yielded token has shape `(1, 1)`. The first `squeeze(0)` removes the batch dimension for
+  decoding, and `.tolist()` converts it to a Python list.
+- `end=""` avoids adding a newline after each token; `flush=True` makes the stream appear
+  immediately.
+- The tensor form is appended to `generated_ids`, then `torch.cat(..., dim=0)` makes one output
+  token tensor for the statistics helper.
+
+The CPU runs in this notebook produced the same sentence each time at about 14 tokens per second.
+Because CUDA was available while the tensors remained on CPU, the helper warned that CUDA memory
+statistics could be zero.
+
+## 9. Repeating the benchmark on CUDA
+
+The detected accelerator is selected again:
+
+```python
+device = get_device()
+```
+
+On the study machine, this returns CUDA. Both the model and existing input tensor must then move to
+the same device:
+
+```python
+
+
+model_cuda = model.to(device)
+input_token_ids_tensor = input_token_ids_tensor.to(device)
+
+for i in range(3):
+    torch.cuda.synchronize()
+    start_time = time.perf_counter()
+
+    generated_ids = []
+
+    for token in generate_text_basic_stream_cache(
+        model=model_cuda,
+        token_ids=input_token_ids_tensor,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=tokenizer.eos_token_id,
+    ):
+        token_id = token.squeeze(0).tolist()
+        print(tokenizer.decode(token_id), end="", flush=True)
+        generated_ids.append(token.squeeze(0))
+
+    torch.cuda.synchronize()
+    end_time = time.perf_counter()
+
+    if i == 0:
+            print("\n\nWarm-up run")
+    else:
+        print(f"\n\nTimed run {i}:")
+
+    output_token_ids_tensor = torch.cat(generated_ids, dim=0)
+    generate_stats(
+        output_token_ids_tensor, tokenizer, start_time, end_time
+        )
+    print(f"\n{30 * '-'}\n")
+```
+
+- `model.to(device)` and `input_token_ids_tensor.to(device)` prevent a device mismatch between model
+  parameters and input data.
+- `torch.cuda.synchronize()` before the timer waits for earlier GPU work to finish.
+- `time.perf_counter()` provides a high-resolution elapsed-time clock.
+- A second synchronization before `end_time` is essential because CUDA launches work
+  asynchronously; otherwise the timer could stop before the GPU finishes.
+- The generation, decoding, collection, and statistics steps otherwise mirror the CPU loop.
+
+In this notebook, the first CUDA run took about 1.77 seconds. The two timed runs took roughly 1.39
+and 1.42 seconds, corresponding to 29 and 28 tokens per second, with about 1.45 GB of peak allocated
+CUDA memory. These values describe one machine and one software configuration; the method of
+measurement matters more than the absolute numbers.
+
+## 10. What this chapter establishes
+
+The chapter's main result is a reusable inference pipeline:
+
+```text
+download assets
+  → construct tokenizer and model
+  → load pretrained weights
+  → choose a device
+  → encode a batched prompt
+  → prefill the KV cache
+  → decode and stream one token at a time
+  → measure synchronized execution
+```
+
+The basic generator makes autoregressive decoding easy to inspect. The cached generator preserves
+the same output behavior while avoiding repeated computation over the entire context. That cached
+streaming function becomes infrastructure for evaluating reasoning models in Chapter 3.
