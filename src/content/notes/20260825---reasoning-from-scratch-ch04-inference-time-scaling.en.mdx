@@ -1,0 +1,500 @@
+---
+title: 'Improving Reasoning with Inference-Time Scaling: Chapter 4 Study Notes'
+description: 'A code-first walkthrough of chain-of-thought prompting, temperature scaling, top-p sampling, and self-consistency voting with Qwen3.'
+date: 2026-08-25
+tags:
+  - reasoning-models
+  - llm
+  - inference-time-scaling
+  - sampling
+  - qwen3
+  - book-notes
+language: 'en'
+translationKey: '20260825---reasoning-from-scratch-ch04-inference-time-scaling'
+type: note
+status: ready
+draft: false
+---
+
+> **Source note**
+>
+> This is my study note for Chapter 4, “Improving Reasoning with Inference-Time Scaling,” of
+> Sebastian Raschka's _Build a Reasoning Model (From Scratch)_. The code follows my chapter
+> notebook and the book's
+> [official companion repository](https://github.com/rasbt/reasoning-from-scratch). The code
+> remains the author's work under the repository's license. Codex generated this first draft from
+> my notebook; the Chinese version is a Codex-assisted translation. This note is an explanatory
+> record of my study and does not replace the book.
+
+The previous chapters built a cached generation function and a verifier for mathematical answers.
+Chapter 4 uses those pieces to improve an already trained model without changing its weights. The
+central idea is **inference-time scaling**: spend more computation while answering a question.
+
+This notebook combines two forms of extra inference compute:
+
+```text
+one longer reasoning trace
+  → chain-of-thought prompting
+
+several diverse reasoning traces
+  → temperature + top-p sampling
+  → extract each final answer
+  → majority vote
+```
+
+The first method lets one response use more tokens. The second generates multiple responses and
+uses self-consistency to aggregate them. Both can improve reliability, but both increase latency
+and computation.
+
+## 1. Loading the pretrained model
+
+The notebook reuses the Qwen3 loader and prompt renderer from Chapters 2 and 3:
+
+```python
+import torch
+from reasoning_from_scratch.ch02 import (
+    generate_text_basic_stream_cache,
+    get_device,
+)
+from reasoning_from_scratch.ch03 import (
+    load_model_and_tokenizer,
+    render_prompt,
+)
+
+# CPU is enough while implementing the sampling utilities.
+device = torch.device("cpu")
+
+model, tokenizer = load_model_and_tokenizer(
+    which_model="base",
+    device=device,
+    use_compile=False,
+)
+```
+
+- `load_model_and_tokenizer(...)` constructs the Qwen3 0.6B base model and loads its checkpoint
+  and tokenizer.
+- `which_model="base"` is important: the experiment studies how prompting and decoding affect a
+  pretrained base model rather than an instruction-tuned model.
+- `use_compile=False` keeps the setup simple while the generation logic is being changed.
+- CPU execution is sufficient for implementing the functions; the final repeated-sampling
+  experiment uses `get_device()` so that CUDA is selected when available.
+
+No training occurs in this chapter. The model parameters remain fixed throughout.
+
+## 2. Asking for a chain of thought
+
+The simplest inference-time intervention is to append an instruction that asks the model to expose
+intermediate steps:
+
+```python
+def prompt_with_cot(prompt):
+    return render_prompt(prompt) + "\n\nExplain step by step."
+```
+
+`render_prompt(prompt)` first creates the math-assistant prompt used by the evaluator. The extra
+sentence encourages the model to produce a longer reasoning trace before its boxed final answer.
+
+This does not alter the model or guarantee valid reasoning. It only changes the conditional text
+distribution by changing the prompt. It can help when intermediate computation gives the model
+more opportunities to follow a useful solution pattern, but it also consumes more tokens and may
+encourage unnecessary reasoning on easy questions.
+
+## 3. Temperature acts on logits
+
+Greedy decoding always selects the token with the largest logit. To produce diverse solutions,
+the notebook first rescales the next-token logits by a positive temperature $T$:
+
+$$
+\widetilde{z}_i=\frac{z_i}{T},
+\qquad
+p_i(T)=\frac{\exp(\widetilde{z}_i)}{\sum_j\exp(\widetilde{z}_j)}.
+$$
+
+The implementation is deliberately small:
+
+```python
+def scale_logits_by_temperature(logits, temperature):
+    if temperature <= 0:
+        raise ValueError("Temperature must be positive")
+    return logits / temperature
+```
+
+The rescaling happens before softmax:
+
+- $0<T<1$ magnifies logit differences and produces a sharper distribution.
+- $T=1$ leaves the distribution unchanged.
+- $T>1$ compresses logit differences and produces a flatter distribution.
+- As $T\to 0^+$, sampling approaches greedy selection when the maximum logit is unique.
+
+Temperature therefore controls the entropy and diversity of sampling. Calling high temperature
+“creative” and low temperature “accurate” is only a rough intuition: the relationship between
+temperature and answer quality depends on the model, prompt, and task.
+
+Dividing already normalized probabilities by $T$ would not produce the same distribution and would
+require renormalization. Temperature scaling is conventionally defined in logit space, before
+softmax.
+
+## 4. Making the generation wrapper pluggable
+
+Chapter 2's wrapper is generalized so that it can call either greedy generation or a new sampling
+function:
+
+```python
+from reasoning_from_scratch.ch02 import generate_text_basic_stream_cache
+
+
+def generate_text_stream_concat_flex(
+    model,
+    tokenizer,
+    prompt,
+    device,
+    max_new_tokens,
+    verbose=False,
+    generate_func=None,
+    **generate_kwargs,
+):
+    if generate_func is None:
+        generate_func = generate_text_basic_stream_cache
+
+    input_ids = torch.tensor(
+        tokenizer.encode(prompt),
+        device=device,
+    ).unsqueeze(0)
+
+    generated_ids = []
+    for token in generate_func(
+        model=model,
+        token_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=tokenizer.eos_token_id,
+        **generate_kwargs,
+    ):
+        next_token_id = token.squeeze(0)
+        generated_ids.append(next_token_id.item())
+
+        if verbose:
+            print(
+                tokenizer.decode(next_token_id.tolist()),
+                end="",
+                flush=True,
+            )
+
+    return tokenizer.decode(generated_ids)
+```
+
+The wrapper has three responsibilities:
+
+1. Encode the prompt and add a batch dimension.
+2. Consume one yielded token at a time from `generate_func`.
+3. Collect and decode the generated token IDs.
+
+`**generate_kwargs` forwards strategy-specific controls such as `temperature` and `top_p`. The
+surrounding code no longer needs to know whether the generator uses argmax or probabilistic
+sampling.
+
+## 5. Keeping a nucleus with top-p filtering
+
+Temperature can assign nonzero probability to every token in the vocabulary, including a very
+long tail of implausible choices. **Top-p**, or **nucleus**, sampling restricts the next-token
+distribution to a high-probability prefix.
+
+For probabilities sorted in descending order,
+
+$$
+p_{(1)}\geq p_{(2)}\geq\cdots\geq p_{(V)},
+$$
+
+top-p keeps the smallest prefix whose cumulative mass reaches or exceeds a threshold $p$. The
+remaining tokens receive probability zero, and the kept values are renormalized.
+
+```python
+def top_p_filter(probas, top_p):
+    if top_p is None or top_p >= 1.0:
+        return probas
+
+    sorted_probas, sorted_idx = torch.sort(
+        probas,
+        dim=1,
+        descending=True,
+    )
+    cumprobas = torch.cumsum(sorted_probas, dim=1)
+
+    # Mass before each token is added.
+    prefix = cumprobas - sorted_probas
+    keep = prefix < top_p
+    keep[:, 0] = True
+
+    kept_sorted = torch.where(
+        keep,
+        sorted_probas,
+        torch.zeros_like(sorted_probas),
+    )
+
+    filtered = torch.zeros_like(probas).scatter(
+        1,
+        sorted_idx,
+        kept_sorted,
+    )
+    denom = torch.sum(filtered, dim=1, keepdim=True).clamp_min(1e-12)
+    return filtered / denom
+```
+
+The subtle line is
+
+```python
+prefix = cumprobas - sorted_probas
+keep = prefix < top_p
+```
+
+Testing the mass _before_ adding each token keeps the boundary token that makes the cumulative
+mass cross `top_p`. If the code instead retained only entries whose cumulative mass was already
+below the threshold, it could discard that boundary token and keep too little probability mass.
+
+`scatter(...)` restores the probabilities to their original vocabulary positions, and division by
+`denom` turns the filtered values back into a valid distribution. The first token is explicitly
+kept so the result cannot be empty.
+
+Unlike top-k sampling, the number of retained tokens is adaptive. A confident distribution may
+need only a few tokens to reach $p$, while a flatter distribution may retain many.
+
+## 6. Combining cached generation and multinomial sampling
+
+The new generator keeps the KV cache from Chapter 2 and changes only the next-token selection
+step:
+
+```python
+from reasoning_from_scratch.qwen3 import KVCache
+
+
+@torch.inference_mode()
+def generate_text_top_p_stream_cache(
+    model,
+    token_ids,
+    max_new_tokens,
+    eos_token_id=None,
+    temperature=0.0,
+    top_p=None,
+):
+    model.eval()
+    cache = KVCache(n_layers=model.cfg["n_layers"])
+    model.reset_kv_cache()
+
+    out = model(token_ids, cache=cache)[:, -1]
+
+    for _ in range(max_new_tokens):
+        orig_device = token_ids.device
+
+        if temperature is None or temperature == 0.0:
+            next_token = torch.argmax(out, dim=-1, keepdim=True)
+        else:
+            logits = scale_logits_by_temperature(out, temperature)
+            probas = torch.softmax(logits, dim=-1)
+            probas = top_p_filter(probas, top_p)
+
+            next_token = torch.multinomial(
+                probas.cpu(),
+                num_samples=1,
+            ).to(orig_device)
+
+        if (
+            eos_token_id is not None
+            and torch.all(next_token == eos_token_id)
+        ):
+            break
+
+        yield next_token
+        out = model(next_token, cache=cache)[:, -1]
+```
+
+The execution path is:
+
+```text
+prompt tokens
+  → one full forward pass that fills the KV cache
+  → last-position logits
+  → greedy argmax, or temperature → softmax → top-p → multinomial
+  → yield the selected token
+  → one-token cached forward pass
+  → repeat
+```
+
+When `temperature` is `0.0` or `None`, the function uses deterministic argmax and does not call the
+positive-temperature helper. Otherwise, `torch.multinomial` draws one token according to the
+filtered categorical distribution.
+
+The probabilities are moved to CPU for multinomial sampling in this notebook, and the chosen token
+is moved back to the model's original device. This is simple and portable, although repeated
+device transfers may become a performance consideration in larger workloads.
+
+## 7. Voting across several answers
+
+Self-consistency uses diversity as a source of evidence. Instead of trusting one sampled reasoning
+trace, it generates several, extracts each final result, and selects the most frequent answer.
+
+```python
+from collections import Counter
+from reasoning_from_scratch.ch03 import extract_final_candidate
+
+
+def self_consistency_vote(
+    model,
+    tokenizer,
+    prompt,
+    device,
+    num_samples=10,
+    temperature=0.8,
+    top_p=0.9,
+    max_new_tokens=2048,
+    show_progress=True,
+    show_long_answer=False,
+    seed=None,
+):
+    full_answers = []
+    short_answers = []
+
+    for i in range(num_samples):
+        if seed is not None:
+            torch.manual_seed(seed + i + 1)
+
+        answer = generate_text_stream_concat_flex(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            device=device,
+            max_new_tokens=max_new_tokens,
+            verbose=show_long_answer,
+            generate_func=generate_text_top_p_stream_cache,
+            temperature=temperature,
+            top_p=top_p,
+        )
+
+        short = extract_final_candidate(
+            answer,
+            fallback="number_then_full",
+        )
+        full_answers.append(answer)
+        short_answers.append(short)
+
+        if show_progress:
+            print(f"[Sample {i + 1}/{num_samples}]  →  {short!r}")
+
+    counts = Counter(short_answers)
+    groups = {answer: [] for answer in counts}
+    for idx, answer in enumerate(short_answers):
+        groups[answer].append(idx)
+
+    ranked = counts.most_common()
+    if not ranked:
+        majority_winners = []
+        final_answer = None
+    else:
+        top_frequency = ranked[0][1]
+        majority_winners = [
+            answer
+            for answer, frequency in ranked
+            if frequency == top_frequency
+        ]
+        final_answer = (
+            ranked[0][0]
+            if len(majority_winners) == 1
+            else None
+        )
+
+    return {
+        "full_answers": full_answers,
+        "short_answers": short_answers,
+        "counts": dict(counts),
+        "groups": groups,
+        "majority_winners": majority_winners,
+        "final_answer": final_answer,
+    }
+```
+
+Several design choices are useful:
+
+- `seed + i + 1` makes the experiment reproducible while still giving each sample a different
+  random stream.
+- `extract_final_candidate(...)` reuses Chapter 3's answer contract instead of voting over entire
+  prose responses.
+- `Counter` records how often each normalized candidate appears.
+- `groups` preserves the indices of the full solutions behind each candidate, which is useful for
+  later inspection.
+- A tie produces `final_answer=None` rather than choosing an arbitrary winner.
+
+Self-consistency only works as well as the extraction and normalization pipeline. Equivalent
+answers written in different forms must be canonicalized, or their votes may be split across
+separate strings.
+
+## 8. A small comparison with and without chain-of-thought prompting
+
+The notebook uses the equation
+
+> Half the value of $3x-9$ is $x+37$. What is the value of $x$?
+
+The exact solution is
+
+$$
+\frac{3x-9}{2}=x+37
+\quad\Longrightarrow\quad
+3x-9=2x+74
+\quad\Longrightarrow\quad
+x=83.
+$$
+
+The standard prompt asks the model to put its final result in `\boxed{ANSWER}`. Five samples are
+then generated with `temperature=0.8`, `top_p=0.9`, and a fixed seed.
+
+Without the extra chain-of-thought instruction, the extracted candidates were:
+
+```text
+83, 22, 54, 83, 83
+```
+
+The majority vote still selected the correct value, `83`, with three of five votes. The run took
+approximately 42.6 seconds on the recorded machine.
+
+With `Explain step by step.` appended to the prompt, the candidates were:
+
+```text
+83, 83, 83, 83, 83
+```
+
+All five samples were correct, while runtime increased to approximately 96.7 seconds—about 2.3
+times the first run.
+
+This is a useful illustration, not an accuracy estimate. It contains one problem, five samples per
+condition, and one model/seed configuration. A publishable model comparison would require a larger
+benchmark, repeated runs, and a report of accuracy, latency, token counts, and compute cost.
+
+## 9. What is actually being scaled?
+
+Inference-time scaling is not one knob. This chapter increases compute along two different axes:
+
+| Method                     | Extra computation                    | Potential benefit                          | Main cost                             |
+| -------------------------- | ------------------------------------ | ------------------------------------------ | ------------------------------------- |
+| Chain-of-thought prompting | More tokens in one response          | More room for intermediate reasoning       | Longer single-response latency        |
+| Self-consistency           | More independently sampled responses | Majority vote can suppress isolated errors | Cost grows roughly with sample count  |
+| Temperature and top-p      | Different token-selection rule       | Produces the diversity needed for voting   | Can also introduce low-quality traces |
+
+Temperature and top-p do not by themselves add much model compute per token. Their main role is to
+make multiple samples meaningfully different. The expensive part of self-consistency is generating
+those additional sequences.
+
+The practical objective is therefore not “maximize reasoning tokens” or “maximize sample count.” It
+is to choose a compute budget that improves task-level reliability enough to justify its latency
+and cost.
+
+## 10. What this chapter establishes
+
+Chapter 4 turns the deterministic generation pipeline into a controllable inference system:
+
+1. Chain-of-thought prompting allocates more tokens to one solution path.
+2. Temperature rescales logits and controls sampling entropy.
+3. Top-p removes the low-probability tail while preserving an adaptive nucleus.
+4. Multinomial sampling creates diverse candidate solutions.
+5. Self-consistency extracts and aggregates their final answers.
+6. The recorded example shows the central trade-off: greater agreement and accuracy can require
+   substantially more inference time.
+
+The model has not learned new weights. The improvement comes entirely from how the fixed model is
+prompted, sampled, and queried multiple times.

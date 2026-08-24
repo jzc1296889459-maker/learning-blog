@@ -1,0 +1,477 @@
+---
+title: '使用推理时扩展改进推理：Reasoning from Scratch 第 4 章笔记'
+description: '逐行梳理 chain-of-thought prompting、temperature scaling、top-p sampling，以及 Qwen3 的 self-consistency voting。'
+date: 2026-08-25
+tags:
+  - reasoning-models
+  - llm
+  - inference-time-scaling
+  - sampling
+  - qwen3
+  - book-notes
+language: 'zh-CN'
+type: note
+status: ready
+draft: false
+---
+
+> **来源与翻译说明**
+>
+> 本文是我学习 Sebastian Raschka 的 _Build a Reasoning Model (From Scratch)_ 第 4 章
+> “Improving Reasoning with Inference-Time Scaling” 时所做的笔记。代码来自我的章节 Notebook，
+> 并参考本书的[官方配套仓库](https://github.com/rasbt/reasoning-from-scratch)；代码版权归原作者
+> 所有，并遵循该仓库的许可证。Codex 根据我的 Notebook 生成了这份初稿，并辅助完成中英文版本。
+> 本文只是我对学习过程的解释性记录，不能替代原书。
+
+前几章已经实现了带 KV cache 的生成函数和数学答案 verifier。第 4 章复用这些组件，在不改变模型
+权重的前提下提高推理表现。核心思想是 **inference-time scaling**：在回答问题时投入更多计算。
+
+本 Notebook 组合了两种额外的 inference compute：
+
+```text
+一条更长的推理轨迹
+  → chain-of-thought prompting
+
+多条不同的推理轨迹
+  → temperature + top-p sampling
+  → 提取每个最终答案
+  → majority vote
+```
+
+第一种方法让一次回答使用更多 token；第二种方法生成多个回答，再用 self-consistency 聚合它们。
+两者都可能提高可靠性，但也都会增加 latency 和计算量。
+
+## 1. 加载预训练模型
+
+Notebook 复用了第 2、3 章中的 Qwen3 loader 和 prompt renderer：
+
+```python
+import torch
+from reasoning_from_scratch.ch02 import (
+    generate_text_basic_stream_cache,
+    get_device,
+)
+from reasoning_from_scratch.ch03 import (
+    load_model_and_tokenizer,
+    render_prompt,
+)
+
+# 实现 sampling utilities 时，CPU 已经足够。
+device = torch.device("cpu")
+
+model, tokenizer = load_model_and_tokenizer(
+    which_model="base",
+    device=device,
+    use_compile=False,
+)
+```
+
+- `load_model_and_tokenizer(...)` 构造 Qwen3 0.6B base model，并加载 checkpoint 和 tokenizer。
+- `which_model="base"` 很重要：实验研究 prompting 与 decoding 如何影响预训练 base model，而不是
+  instruction-tuned model。
+- `use_compile=False` 让修改生成逻辑时的运行环境保持简单。
+- 实现函数时使用 CPU 即可；最终的重复采样实验调用 `get_device()`，在可用时选择 CUDA。
+
+本章没有进行训练，模型参数始终保持不变。
+
+## 2. 请求模型写出 chain of thought
+
+最简单的 inference-time intervention，是在 prompt 后加入一条要求模型展示中间步骤的指令：
+
+```python
+def prompt_with_cot(prompt):
+    return render_prompt(prompt) + "\n\nExplain step by step."
+```
+
+`render_prompt(prompt)` 首先生成 evaluator 使用的 math-assistant prompt，额外的句子则鼓励模型在
+boxed final answer 之前写出更长的推理轨迹。
+
+这不会改变模型，也不能保证推理过程正确。它只是通过修改 prompt 改变 conditional text
+distribution。当中间计算让模型有更多机会遵循有效的 solution pattern 时，它可能有所帮助；但它
+也会使用更多 token，并可能让简单问题出现不必要的过度推理。
+
+## 3. Temperature 作用于 logits
+
+Greedy decoding 总是选择 logit 最大的 token。为了生成不同的解答，Notebook 首先使用正的
+temperature $T$ 缩放 next-token logits：
+
+$$
+\widetilde{z}_i=\frac{z_i}{T},
+\qquad
+p_i(T)=\frac{\exp(\widetilde{z}_i)}{\sum_j\exp(\widetilde{z}_j)}.
+$$
+
+实现非常简短：
+
+```python
+def scale_logits_by_temperature(logits, temperature):
+    if temperature <= 0:
+        raise ValueError("Temperature must be positive")
+    return logits / temperature
+```
+
+缩放发生在 softmax 之前：
+
+- $0<T<1$ 放大 logits 之间的差异，使分布更尖锐。
+- $T=1$ 不改变分布。
+- $T>1$ 压缩 logits 之间的差异，使分布更平坦。
+- 当 $T\to 0^+$，如果最大 logit 唯一，sampling 会趋近 greedy selection。
+
+因此，temperature 控制的是 sampling 的 entropy 和 diversity。把高 temperature 简单称为
+“creative”、低 temperature 称为“accurate”只能作为粗略直觉；temperature 与答案质量的关系取决于
+模型、prompt 和任务。
+
+如果对已经归一化的 probability 直接除以 $T$，不仅不会得到相同分布，还需要再次归一化。
+Temperature scaling 通常定义在 logit space，并位于 softmax 之前。
+
+## 4. 让 generation wrapper 可以替换策略
+
+第 2 章的 wrapper 被扩展为既能调用 greedy generation，也能调用新的 sampling function：
+
+```python
+from reasoning_from_scratch.ch02 import generate_text_basic_stream_cache
+
+
+def generate_text_stream_concat_flex(
+    model,
+    tokenizer,
+    prompt,
+    device,
+    max_new_tokens,
+    verbose=False,
+    generate_func=None,
+    **generate_kwargs,
+):
+    if generate_func is None:
+        generate_func = generate_text_basic_stream_cache
+
+    input_ids = torch.tensor(
+        tokenizer.encode(prompt),
+        device=device,
+    ).unsqueeze(0)
+
+    generated_ids = []
+    for token in generate_func(
+        model=model,
+        token_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=tokenizer.eos_token_id,
+        **generate_kwargs,
+    ):
+        next_token_id = token.squeeze(0)
+        generated_ids.append(next_token_id.item())
+
+        if verbose:
+            print(
+                tokenizer.decode(next_token_id.tolist()),
+                end="",
+                flush=True,
+            )
+
+    return tokenizer.decode(generated_ids)
+```
+
+这个 wrapper 有三项职责：
+
+1. 编码 prompt 并加入 batch dimension。
+2. 从 `generate_func` 逐个消费 yield 出来的 token。
+3. 收集并 decode 所生成的 token ID。
+
+`**generate_kwargs` 把 `temperature`、`top_p` 等特定于策略的参数继续传递下去。外围代码不再需要
+知道 generator 使用的是 argmax 还是 probabilistic sampling。
+
+## 5. 使用 top-p 保留 nucleus
+
+Temperature 可能为 vocabulary 中每一个 token 分配非零概率，其中包括很长的低概率尾部。
+**Top-p**（也称 **nucleus sampling**）把 next-token distribution 限制在一个高概率前缀中。
+
+将概率按降序排列：
+
+$$
+p_{(1)}\geq p_{(2)}\geq\cdots\geq p_{(V)}.
+$$
+
+Top-p 保留 cumulative mass 达到或超过阈值 $p$ 的最短前缀，将其余 token 的概率设为零，然后对
+保留的值重新归一化。
+
+```python
+def top_p_filter(probas, top_p):
+    if top_p is None or top_p >= 1.0:
+        return probas
+
+    sorted_probas, sorted_idx = torch.sort(
+        probas,
+        dim=1,
+        descending=True,
+    )
+    cumprobas = torch.cumsum(sorted_probas, dim=1)
+
+    # 加入当前 token 之前的 cumulative mass。
+    prefix = cumprobas - sorted_probas
+    keep = prefix < top_p
+    keep[:, 0] = True
+
+    kept_sorted = torch.where(
+        keep,
+        sorted_probas,
+        torch.zeros_like(sorted_probas),
+    )
+
+    filtered = torch.zeros_like(probas).scatter(
+        1,
+        sorted_idx,
+        kept_sorted,
+    )
+    denom = torch.sum(filtered, dim=1, keepdim=True).clamp_min(1e-12)
+    return filtered / denom
+```
+
+最需要注意的是：
+
+```python
+prefix = cumprobas - sorted_probas
+keep = prefix < top_p
+```
+
+检查加入每个 token **之前** 的 probability mass，可以保留那个让累计概率越过 `top_p` 的边界
+token。如果只保留 cumulative mass 本身仍低于阈值的项目，就可能丢掉边界 token，使留下的总概率
+不足。
+
+`scatter(...)` 把 probability 放回原来的 vocabulary position，再除以 `denom`，得到合法的过滤后
+分布。代码还显式保留第一个 token，避免结果为空。
+
+Top-p 与 top-k 不同：保留的 token 数量是自适应的。尖锐的分布可能只需要几个 token 就达到
+$p$，平坦的分布则可能保留更多 token。
+
+## 6. 组合 cached generation 与 multinomial sampling
+
+新的 generator 保留第 2 章的 KV cache，只修改 next-token selection：
+
+```python
+from reasoning_from_scratch.qwen3 import KVCache
+
+
+@torch.inference_mode()
+def generate_text_top_p_stream_cache(
+    model,
+    token_ids,
+    max_new_tokens,
+    eos_token_id=None,
+    temperature=0.0,
+    top_p=None,
+):
+    model.eval()
+    cache = KVCache(n_layers=model.cfg["n_layers"])
+    model.reset_kv_cache()
+
+    out = model(token_ids, cache=cache)[:, -1]
+
+    for _ in range(max_new_tokens):
+        orig_device = token_ids.device
+
+        if temperature is None or temperature == 0.0:
+            next_token = torch.argmax(out, dim=-1, keepdim=True)
+        else:
+            logits = scale_logits_by_temperature(out, temperature)
+            probas = torch.softmax(logits, dim=-1)
+            probas = top_p_filter(probas, top_p)
+
+            next_token = torch.multinomial(
+                probas.cpu(),
+                num_samples=1,
+            ).to(orig_device)
+
+        if (
+            eos_token_id is not None
+            and torch.all(next_token == eos_token_id)
+        ):
+            break
+
+        yield next_token
+        out = model(next_token, cache=cache)[:, -1]
+```
+
+执行路径是：
+
+```text
+prompt tokens
+  → 一次完整 forward pass，填充 KV cache
+  → last-position logits
+  → greedy argmax，或 temperature → softmax → top-p → multinomial
+  → yield 选中的 token
+  → 单 token cached forward pass
+  → 重复
+```
+
+当 `temperature` 为 `0.0` 或 `None` 时，函数使用 deterministic argmax，不会调用只接受正数的
+temperature helper。其他情况下，`torch.multinomial` 按过滤后的 categorical distribution 抽取
+一个 token。
+
+Notebook 把 probability 移到 CPU 上执行 multinomial sampling，再把选中的 token 移回模型原来的
+device。这样写简单且容易兼容不同环境，但在更大的 workload 中，重复的 device transfer 可能成为
+性能因素。
+
+## 7. 对多个答案进行投票
+
+Self-consistency 把 diversity 当作一种证据。它不直接相信一条 sampled reasoning trace，而是生成
+多条 trace、提取各自的 final result，再选择出现次数最多的答案。
+
+```python
+from collections import Counter
+from reasoning_from_scratch.ch03 import extract_final_candidate
+
+
+def self_consistency_vote(
+    model,
+    tokenizer,
+    prompt,
+    device,
+    num_samples=10,
+    temperature=0.8,
+    top_p=0.9,
+    max_new_tokens=2048,
+    show_progress=True,
+    show_long_answer=False,
+    seed=None,
+):
+    full_answers = []
+    short_answers = []
+
+    for i in range(num_samples):
+        if seed is not None:
+            torch.manual_seed(seed + i + 1)
+
+        answer = generate_text_stream_concat_flex(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            device=device,
+            max_new_tokens=max_new_tokens,
+            verbose=show_long_answer,
+            generate_func=generate_text_top_p_stream_cache,
+            temperature=temperature,
+            top_p=top_p,
+        )
+
+        short = extract_final_candidate(
+            answer,
+            fallback="number_then_full",
+        )
+        full_answers.append(answer)
+        short_answers.append(short)
+
+        if show_progress:
+            print(f"[Sample {i + 1}/{num_samples}]  →  {short!r}")
+
+    counts = Counter(short_answers)
+    groups = {answer: [] for answer in counts}
+    for idx, answer in enumerate(short_answers):
+        groups[answer].append(idx)
+
+    ranked = counts.most_common()
+    if not ranked:
+        majority_winners = []
+        final_answer = None
+    else:
+        top_frequency = ranked[0][1]
+        majority_winners = [
+            answer
+            for answer, frequency in ranked
+            if frequency == top_frequency
+        ]
+        final_answer = (
+            ranked[0][0]
+            if len(majority_winners) == 1
+            else None
+        )
+
+    return {
+        "full_answers": full_answers,
+        "short_answers": short_answers,
+        "counts": dict(counts),
+        "groups": groups,
+        "majority_winners": majority_winners,
+        "final_answer": final_answer,
+    }
+```
+
+这里有几个有用的设计：
+
+- `seed + i + 1` 让实验可复现，同时为每个 sample 提供不同的 random stream。
+- `extract_final_candidate(...)` 复用第 3 章的 answer contract，而不是对整段 prose response 投票。
+- `Counter` 记录每个 normalized candidate 出现的次数。
+- `groups` 保存每个 candidate 对应的完整解答索引，便于之后检查。
+- 出现并列第一时，`final_answer=None`，而不是任意选择一个 winner。
+
+Self-consistency 的效果受 answer extraction 和 normalization pipeline 限制。如果数学上等价的答案
+采用不同写法却没有被 canonicalize，它们的 vote 可能被拆成多个不同字符串。
+
+## 8. 比较有无 chain-of-thought prompting 的小实验
+
+Notebook 使用了下面这道方程题：
+
+> Half the value of $3x-9$ is $x+37$. What is the value of $x$?
+
+准确解为：
+
+$$
+\frac{3x-9}{2}=x+37
+\quad\Longrightarrow\quad
+3x-9=2x+74
+\quad\Longrightarrow\quad
+x=83.
+$$
+
+标准 prompt 要求模型把最终结果写进 `\boxed{ANSWER}`。然后使用 `temperature=0.8`、`top_p=0.9`
+和固定 seed 生成 5 个 sample。
+
+没有额外 chain-of-thought instruction 时，提取到的 candidate 为：
+
+```text
+83, 22, 54, 83, 83
+```
+
+Majority vote 仍然以 5 票中的 3 票选出正确答案 `83`。在记录实验的机器上，这次运行大约花费
+42.6 秒。
+
+在 prompt 后加入 `Explain step by step.` 时，candidate 为：
+
+```text
+83, 83, 83, 83, 83
+```
+
+5 个 sample 全部正确，但 runtime 增加到大约 96.7 秒，是第一次运行的约 2.3 倍。
+
+这只是一个有用的示例，不是 accuracy estimate。它只包含一道题、每种条件 5 个 sample，以及一组
+model/seed 配置。正式的模型比较需要更大的 benchmark、多次重复实验，并同时报告 accuracy、
+latency、token 数量和 compute cost。
+
+## 9. 实际上扩展了什么？
+
+Inference-time scaling 不是单一的旋钮。本章沿两个不同维度增加计算：
+
+| 方法                       | 额外计算                        | 潜在收益                       | 主要代价                   |
+| -------------------------- | ------------------------------- | ------------------------------ | -------------------------- |
+| Chain-of-thought prompting | 一次回答生成更多 token          | 为中间推理提供更多空间         | 单次回答 latency 更长      |
+| Self-consistency           | 生成更多相互独立的 sample       | Majority vote 可以抑制孤立错误 | 成本大致随 sample 数量增长 |
+| Temperature 与 top-p       | 使用不同的 token-selection rule | 产生投票所需的 diversity       | 也可能引入低质量 trace     |
+
+Temperature 和 top-p 本身不会显著增加每个 token 的模型计算。它们的主要作用，是让多个 sample
+产生有意义的差异。Self-consistency 真正昂贵的部分，是生成这些额外 sequence。
+
+因此，实践目标不是“最大化 reasoning token”或“最大化 sample 数量”，而是选择一个 compute
+budget，使 task-level reliability 的提升足以抵消 latency 和成本。
+
+## 10. 本章建立的基础
+
+第 4 章把 deterministic generation pipeline 变成了可控的 inference system：
+
+1. Chain-of-thought prompting 为一条 solution path 分配更多 token。
+2. Temperature 缩放 logits，控制 sampling entropy。
+3. Top-p 去掉低概率尾部，同时保留大小自适应的 nucleus。
+4. Multinomial sampling 生成不同的 candidate solution。
+5. Self-consistency 提取并聚合它们的 final answer。
+6. Notebook 中的实验展示了核心 trade-off：更高的一致性和准确率可能需要显著更多 inference time。
+
+模型没有学到任何新权重。所有改进都来自如何 prompt 固定模型、如何 sampling，以及对同一问题进行
+多次查询。
