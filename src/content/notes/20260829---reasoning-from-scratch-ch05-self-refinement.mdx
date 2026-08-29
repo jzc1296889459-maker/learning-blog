@@ -1,0 +1,324 @@
+---
+title: '让模型审阅并改写自己的答案：Reasoning from Scratch 第 5 章笔记'
+description: '从序列对数概率到 critique-refine 循环，分析 Qwen3 自我改进流程，以及评分器为什么可能保留错误答案。'
+date: 2026-08-29
+tags:
+  - reasoning-models
+  - llm
+  - self-refinement
+  - log-probability
+  - qwen3
+  - book-notes
+language: 'zh-CN'
+type: note
+status: ready
+draft: false
+---
+
+> **来源与翻译说明**
+>
+> 本文是我学习 Sebastian Raschka 的 _Build a Reasoning Model (From Scratch)_ 第 5 章
+> “Self-Improving Reasoning” 时所做的笔记。代码来自我的章节 Notebook，并参考本书的
+> [官方配套仓库](https://github.com/rasbt/reasoning-from-scratch)；代码版权归原作者所有，并遵循
+> 该仓库的许可证。Codex 根据我的 Notebook 和其中的个人批注整理了这份初稿，并辅助完成中英文
+> 版本。本文只是我对学习过程的解释性记录，不能替代原书。
+
+第 4 章通过多次采样和 majority vote，在推理时增加计算量。本章尝试另一条路线：让模型先生成
+草稿，再批评草稿，最后根据批评改写答案。
+
+```text
+问题
+  → 初始答案
+  → critique：寻找逻辑、步骤和算术问题
+  → revision：根据 critique 改写
+  → scorer：决定是否接受 revision
+  → 重复
+```
+
+这个流程看起来很自然，但 Notebook 中最有价值的结果并不是“模型可以自我纠错”，而是一个失败
+案例：模型确实多次改出了正确答案，评分器却更喜欢原来的错误答案。因此，self-refinement 的上限
+不仅由 generator 和 critic 决定，也由选择答案的 verifier 或 scorer 决定。
+
+## 1. 用启发式规则评价答案形式
+
+Notebook 首先定义了一个不检查数学正确性的 `heuristic_score`：
+
+```python
+def heuristic_score(
+    answer,
+    prompt=None,
+    brevity_bonus=500.0,
+    boxed_bonus=2.0,
+    extract_bonus=1.0,
+    fulltext_bonus=0.0,
+):
+    score = 0.0
+
+    cand = extract_final_candidate(answer, fallback="none")
+    if cand:
+        score += boxed_bonus
+    else:
+        cand = extract_final_candidate(answer, fallback="number_only")
+        if cand:
+            score += extract_bonus
+        else:
+            cand = extract_final_candidate(
+                answer, fallback="number_then_full"
+            )
+            if cand:
+                score += fulltext_bonus
+
+    score += 1.5 * math.exp(-len(answer) / brevity_bonus)
+    return score
+```
+
+`extract_final_candidate` 的优先级是：
+
+```text
+存在合法的 \boxed{...}？
+├─ 是：返回 boxed 内容，忽略 fallback
+└─ 否：
+   ├─ number_then_full：返回最后一个数字；没有数字则返回全文
+   ├─ number_only：返回最后一个数字；没有数字则返回空字符串
+   └─ 其他值：返回空字符串
+```
+
+所以这套 reward 只鼓励三件事：答案有明确的 boxed result、至少能提取出数字、表达尽量简短。
+它衡量的是**格式和长度**，而不是数学正确性。一个简短但错误的 `\boxed{40}` 仍可能获得很高分。
+
+这揭示了 reward design 的基本问题：模型最终会优化我们实际计算的分数，而不是我们心里想要的
+“好答案”。
+
+## 2. 从 next-token probability 到 sequence likelihood
+
+为了构造另一种 scorer，Notebook 先逐项计算给定文本中真实 next token 的概率：
+
+```python
+@torch.inference_mode()
+def calc_next_token_probas(model, tokenizer, prompt, device, show=True):
+    token_ids = torch.tensor(tokenizer.encode(prompt), device=device)
+    logits = model(token_ids.unsqueeze(0)).squeeze(0)
+    all_probas = torch.softmax(logits, dim=-1)
+
+    t_idx = torch.arange(0, token_ids.shape[0] - 1, device=device)
+    next_ids = token_ids[1:]
+    next_token_probas = all_probas[t_idx, next_ids]
+    prod_next_token_probas = torch.prod(next_token_probas)
+
+    if show:
+        print("Next-token probabilities:", next_token_probas)
+        print("Joint probability:", prod_next_token_probas)
+    else:
+        return next_token_probas, prod_next_token_probas
+```
+
+如果输入共有 $T$ 个 token，那么：
+
+- `token_ids` 的形状是 $(T,)$；加入 batch dimension 后是 $(1,T)$。
+- 模型输出经 `squeeze` 后，`logits` 的形状是 $(T,V)$。
+- `all_probas[i,j]` 表示模型读完位置 $0$ 到 $i$ 后，把 vocabulary ID $j$ 作为下一个
+  token 的概率。
+- `all_probas[t_idx, next_ids]` 用 advanced indexing 一次取出所有实际出现的 next token 概率。
+
+例如，若前几个 token 是 `The capital of Germany`，则第一项对应
+$P(\text{capital}\mid\text{The})$，第二项对应
+$P(\text{of}\mid\text{The capital})$。把这些 conditional probability 相乘，得到序列的
+likelihood：
+
+$$
+P(x_1,\ldots,x_T)
+=P(x_1)\prod_{t=2}^{T}P(x_t\mid x_{<t}).
+$$
+
+## 3. 为什么实际计算 log-probability
+
+直接连乘许多小概率很容易 numerical underflow。假设 200 个 token 的条件概率都约为 $0.01$，乘积
+约为 $0.01^{200}$；但它的对数约为
+$200\log(0.01)\approx-920$，仍然容易表示。
+
+因此，代码改为对 log-probability 求和：
+
+```python
+all_logprobas = torch.log_softmax(logits, dim=-1)
+next_token_logprobas = all_logprobas[t_idx, next_ids]
+sum_next_token_logprobas = torch.sum(next_token_logprobas)
+```
+
+这里应直接使用 `torch.log_softmax`，而不是先 `softmax` 再 `log`。非常小的 probability 可能已经
+在 `softmax` 中被舍入为 0，之后的 `log(0)` 会得到 `-inf`。`log_softmax` 使用稳定的
+log-sum-exp 形式：
+
+$$
+\operatorname{logsoftmax}(z_j)
+=z_j-\log\sum_k e^{z_k}.
+$$
+
+实际计算会先减去最大 logit $m$：
+
+$$
+\log\sum_k e^{z_k}
+=m+\log\sum_k e^{z_k-m},
+$$
+
+从而避免过大的 exponential，也尽量保留低概率 token 的信息。log-probability 越接近 0，代表
+模型认为该 token 或 sequence 越自然。
+
+## 4. 只对 answer 部分评分
+
+比较 response 时，不应该让固定 prompt 的概率进入分数。`avg_logprob_answer` 把 prompt 和 answer
+拼接后，只取 answer token 对应的预测：
+
+```python
+@torch.inference_mode()
+def avg_logprob_answer(model, tokenizer, prompt, answer, device="cpu"):
+    prompt_ids = tokenizer.encode(prompt)
+    answer_ids = tokenizer.encode(answer)
+    full_ids = torch.tensor(prompt_ids + answer_ids, device=device)
+
+    logits = model(full_ids.unsqueeze(0)).squeeze(0)
+    logprobs = torch.log_softmax(logits, dim=-1)
+
+    start = len(prompt_ids) - 1
+    end = full_ids.shape[0] - 1
+    t_idx = torch.arange(start, end, device=device)
+    next_tokens = full_ids[start + 1 : end + 1]
+    next_token_logps = logprobs[t_idx, next_tokens]
+
+    return torch.mean(next_token_logps)
+```
+
+最容易写错的是向左偏移一位。假设 token 排列如下：
+
+```text
+Full tokens:
+
+[p₀, p₁, p₂, p₃, a₀, a₁, a₂]
+ 0   1   2   3   4   5   6
+
+Prediction alignment:
+
+logits[0] → p₁
+logits[1] → p₂
+logits[2] → p₃
+logits[3] → a₀  ← 从这里开始
+logits[4] → a₁
+logits[5] → a₂
+logits[6] → 尚未出现的未来 token
+```
+
+第一个 answer token 位于索引 4，却由索引 3 的 logits 预测，所以
+`start = len(prompt_ids) - 1`。这里对 token log-probability 求平均，是为了让不同长度的答案更容易
+比较；如果直接求和，较长答案通常只因为包含更多负数项而得到更低分。
+
+## 5. 一次 critique-refine 实验
+
+实验问题是：
+
+> Half the value of $3x-9$ is $x+37$. What is the value of $x$?
+
+正确答案是 $x=83$，但固定 seed 下的初始 response 是：
+
+```text
+\boxed{18}
+```
+
+Critique prompt 同时提供原问题和草稿，要求模型检查逻辑、缺失步骤和算术错误，并给出简短修复
+计划。模型的 critique 正确地列出了方程
+$\frac{1}{2}(3x-9)=x+37$ 的求解过程，得出 $x=83$；不过它又错误地声称原题的表述存在
+logical error。
+
+这点很重要：critic 的输出不必完全正确，才能为 revision 提供有用信号。随后，refine prompt 把
+问题、旧答案和 critique 一起交给模型，并要求以 `\boxed{ANSWER}` 结尾。模型把答案改成了：
+
+```text
+\boxed{83}
+```
+
+在这个单次示例中，self-critique 成功提供了初始答案缺少的计算过程，但这还没有解决“如何自动判断
+改写是否更好”的问题。
+
+## 6. 组装迭代 self-refinement loop
+
+完整循环维护当前答案和当前分数。每轮都生成 critique 和 revision，再把 revision 与已接受答案
+比较：
+
+```python
+for it in range(iterations):
+    critique_full = generate_text_stream_concat_flex(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=make_critique_prompt(raw_prompt, current_full),
+        device=device,
+        max_new_tokens=max_critique_tokens,
+        generate_func=generate_text_top_p_stream_cache,
+        temperature=temperature,
+        top_p=top_p,
+    )
+
+    revised_full = generate_text_stream_concat_flex(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=make_refine_prompt(raw_prompt, current_full, critique_full),
+        device=device,
+        max_new_tokens=max_response_tokens,
+        generate_func=generate_text_top_p_stream_cache,
+        temperature=temperature,
+        top_p=top_p,
+    )
+
+    revised_score = score_fn(answer=revised_full, prompt=prompt)
+    if revised_score >= current_score:
+        current_full = revised_full
+        current_score = revised_score
+```
+
+循环还保存每轮的原始答案、提取结果、critique、revision 和前后分数，便于事后审计。通过
+`functools.partial`，Notebook 将 `model`、`tokenizer` 和 `device` 预先绑定到
+`avg_logprob_answer`，使它符合统一的 `score_fn(answer, prompt)` 接口。
+
+## 7. 关键失败：高 likelihood 不等于正确
+
+使用 average answer log-probability 连续 refinement 三轮，结果是：
+
+| 轮次 | 当前答案 | 改写答案 | 当前分数 | 改写分数 |
+| ---- | -------- | -------- | -------- | -------- |
+| 1    | `x=40`   | `x=83`   | -1.141   | -1.633   |
+| 2    | `x=40`   | `x=-1`   | -1.141   | -1.750   |
+| 3    | `x=40`   | `x=83`   | -1.141   | -1.375   |
+
+因为值越接近 0 越好，scorer 三次都保留了错误答案 `x=40`。即使 revision 两次得到正确的
+`x=83`，循环最后仍返回 `x=40`。
+
+Average log-probability 衡量“这段文本在当前模型下有多自然”，并不直接衡量“推理是否正确”。它还
+可能偏爱常见措辞、短答案或模型本来就确信的错误模式。Self-refinement 因此至少需要区分三个角色：
+
+| 角色      | 任务                           | 可能的失败方式                     |
+| --------- | ------------------------------ | ---------------------------------- |
+| Generator | 产生草稿和 revision            | 算错、过早结束、格式不符合要求     |
+| Critic    | 找出具体错误并提出修复计划     | 误报问题、遗漏错误、给出错误建议   |
+| Scorer    | 判断 revision 是否优于当前答案 | 把流畅度或模型自信误当成事实正确性 |
+
+对可验证数学题，更可靠的选择是复用第 3 章的 symbolic/answer verifier，或者组合 correctness、格式、
+长度等多个信号。对开放任务，则可能需要专门训练的 reward model、外部工具或人类评价。
+
+## 8. Self-refinement 与训练的关系
+
+本章的循环发生在 inference time：模型权重没有改变，每轮只是把上一次输出重新放回 context。它的
+成本随 refinement 次数增长，而且错误 critique 也会被带到下一轮。
+
+不过，同样的结构也可以提供 training signal。Notebook 中我的一个观察是：把 critique 用于
+re-training 很自然。[DeepSeekMath-V2](https://arxiv.org/abs/2511.22570) 一类方法进一步训练
+verifier/critic，并利用生成的 critique 和验证数据改进数学推理系统。关键区别是，inference-time
+refinement 临时改变当前 response，而 training 把这种反馈写入参数，使未来问题也可能受益。
+
+## 9. 本章的核心结论
+
+1. Sequence likelihood 是每一步 next-token conditional probability 的乘积。
+2. 实现时应使用 `log_softmax` 和求和，避免 probability product 的 numerical underflow。
+3. Causal LM 的 logits 与目标 token 相差一个位置；answer scoring 必须正确处理这个 shift。
+4. Critique-refine prompting 确实可能把错误答案改正确，但 critic 自己也会产生错误陈述。
+5. Acceptance rule 决定了 refinement 是否真正生效；弱 scorer 可能拒绝正确 revision。
+6. 模型认为“更可能”的答案并不一定“更正确”。对可验证任务，应优先使用与目标一致的 verifier。
+
+本章最有用的教训不是“多反思几次就会更聪明”，而是：**生成、批评和选择是三个不同的问题，任何
+一环的目标错位都会让整个 refinement loop 失败。**

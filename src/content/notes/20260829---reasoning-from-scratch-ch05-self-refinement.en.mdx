@@ -1,0 +1,345 @@
+---
+title: 'Teaching a Model to Review Its Own Answers: Chapter 5 Study Notes'
+description: 'From sequence log-probabilities to a critique-refine loop, including why a plausible scorer can preserve the wrong answer.'
+date: 2026-08-29
+tags:
+  - reasoning-models
+  - llm
+  - self-refinement
+  - log-probability
+  - qwen3
+  - book-notes
+language: 'en'
+translationKey: '20260829---reasoning-from-scratch-ch05-self-refinement'
+type: note
+status: ready
+draft: false
+---
+
+> **Source note**
+>
+> This is my study note for Chapter 5, “Self-Improving Reasoning,” of Sebastian Raschka's
+> _Build a Reasoning Model (From Scratch)_. The code follows my chapter notebook and the book's
+> [official companion repository](https://github.com/rasbt/reasoning-from-scratch). The code
+> remains the author's work under the repository's license. Codex organized this draft from my
+> notebook and my annotations and assisted with the Chinese version. This is an explanatory record
+> of my study and does not replace the book.
+
+Chapter 4 spent more inference-time compute by sampling several answers and taking a majority
+vote. This chapter explores another route: ask the model to draft an answer, critique it, and then
+revise it using its own feedback.
+
+```text
+question
+  → initial answer
+  → critique: find logical, procedural, and arithmetic errors
+  → revision: rewrite using the critique
+  → scorer: decide whether to accept the revision
+  → repeat
+```
+
+The most useful result in my notebook is not simply that a model can correct itself. It is a
+failure case: the model produced the correct revision more than once, but the scorer preferred the
+original wrong answer. Self-refinement is therefore limited not only by the generator and critic,
+but also by the verifier or scorer that selects the answer.
+
+## 1. Scoring answer form with heuristics
+
+The notebook begins with a `heuristic_score` that does not check mathematical correctness:
+
+```python
+def heuristic_score(
+    answer,
+    prompt=None,
+    brevity_bonus=500.0,
+    boxed_bonus=2.0,
+    extract_bonus=1.0,
+    fulltext_bonus=0.0,
+):
+    score = 0.0
+
+    cand = extract_final_candidate(answer, fallback="none")
+    if cand:
+        score += boxed_bonus
+    else:
+        cand = extract_final_candidate(answer, fallback="number_only")
+        if cand:
+            score += extract_bonus
+        else:
+            cand = extract_final_candidate(
+                answer, fallback="number_then_full"
+            )
+            if cand:
+                score += fulltext_bonus
+
+    score += 1.5 * math.exp(-len(answer) / brevity_bonus)
+    return score
+```
+
+`extract_final_candidate` follows this priority:
+
+```text
+Valid \boxed{...} found?
+├─ Yes: return its contents and ignore the fallback
+└─ No:
+   ├─ number_then_full: return the last number, or the full text if none exists
+   ├─ number_only: return the last number, or an empty string if none exists
+   └─ any other value: return an empty string
+```
+
+The reward encourages three properties: an explicit boxed result, at least an extractable number,
+and brevity. It measures **format and length**, not mathematical correctness. A short but incorrect
+`\boxed{40}` can still receive a high score.
+
+This is the basic reward-design problem: a model optimizes the score we actually compute, not the
+notion of a “good answer” that we intended.
+
+## 2. From next-token probability to sequence likelihood
+
+To construct another scorer, the notebook first retrieves the probability of every observed next
+token in a piece of text:
+
+```python
+@torch.inference_mode()
+def calc_next_token_probas(model, tokenizer, prompt, device, show=True):
+    token_ids = torch.tensor(tokenizer.encode(prompt), device=device)
+    logits = model(token_ids.unsqueeze(0)).squeeze(0)
+    all_probas = torch.softmax(logits, dim=-1)
+
+    t_idx = torch.arange(0, token_ids.shape[0] - 1, device=device)
+    next_ids = token_ids[1:]
+    next_token_probas = all_probas[t_idx, next_ids]
+    prod_next_token_probas = torch.prod(next_token_probas)
+
+    if show:
+        print("Next-token probabilities:", next_token_probas)
+        print("Joint probability:", prod_next_token_probas)
+    else:
+        return next_token_probas, prod_next_token_probas
+```
+
+For an input containing $T$ tokens:
+
+- `token_ids` has shape $(T,)$, or $(1,T)$ after adding the batch dimension.
+- After squeezing, `logits` has shape $(T,V)$.
+- `all_probas[i,j]` is the probability of vocabulary ID $j$ coming next after the model has read
+  positions $0$ through $i$.
+- `all_probas[t_idx, next_ids]` uses advanced indexing to select every next token that actually
+  occurred.
+
+For example, if the first tokens are `The capital of Germany`, the first selected value represents
+$P(\text{capital}\mid\text{The})$ and the second represents
+$P(\text{of}\mid\text{The capital})$. Multiplying the conditional probabilities gives the sequence
+likelihood:
+
+$$
+P(x_1,\ldots,x_T)
+=P(x_1)\prod_{t=2}^{T}P(x_t\mid x_{<t}).
+$$
+
+## 3. Why the implementation uses log-probabilities
+
+Multiplying many small probabilities causes numerical underflow. If 200 conditional probabilities
+are each about $0.01$, their product is about $0.01^{200}$. Its logarithm, however, is only
+$200\log(0.01)\approx-920$ and is easy to represent.
+
+The implementation therefore sums log-probabilities:
+
+```python
+all_logprobas = torch.log_softmax(logits, dim=-1)
+next_token_logprobas = all_logprobas[t_idx, next_ids]
+sum_next_token_logprobas = torch.sum(next_token_logprobas)
+```
+
+It is better to call `torch.log_softmax` directly than to calculate `softmax` and then take its
+logarithm. A very small probability may already round to zero during `softmax`, making the later
+`log(0)` equal to `-inf`. `log_softmax` uses the stable log-sum-exp form:
+
+$$
+\operatorname{logsoftmax}(z_j)
+=z_j-\log\sum_k e^{z_k}.
+$$
+
+In practice, it subtracts the largest logit $m$ before exponentiation:
+
+$$
+\log\sum_k e^{z_k}
+=m+\log\sum_k e^{z_k-m}.
+$$
+
+This avoids enormous exponentials and preserves more information about low-probability tokens. A
+log-probability closer to zero means that the model considers the token or sequence more likely.
+
+## 4. Scoring only the answer
+
+When comparing responses, the fixed prompt should not contribute to the score. The
+`avg_logprob_answer` function concatenates prompt and answer tokens but selects only the
+predictions corresponding to the answer:
+
+```python
+@torch.inference_mode()
+def avg_logprob_answer(model, tokenizer, prompt, answer, device="cpu"):
+    prompt_ids = tokenizer.encode(prompt)
+    answer_ids = tokenizer.encode(answer)
+    full_ids = torch.tensor(prompt_ids + answer_ids, device=device)
+
+    logits = model(full_ids.unsqueeze(0)).squeeze(0)
+    logprobs = torch.log_softmax(logits, dim=-1)
+
+    start = len(prompt_ids) - 1
+    end = full_ids.shape[0] - 1
+    t_idx = torch.arange(start, end, device=device)
+    next_tokens = full_ids[start + 1 : end + 1]
+    next_token_logps = logprobs[t_idx, next_tokens]
+
+    return torch.mean(next_token_logps)
+```
+
+The easy mistake is forgetting the one-position shift:
+
+```text
+Full tokens:
+
+[p₀, p₁, p₂, p₃, a₀, a₁, a₂]
+ 0   1   2   3   4   5   6
+
+Prediction alignment:
+
+logits[0] → p₁
+logits[1] → p₂
+logits[2] → p₃
+logits[3] → a₀  ← start here
+logits[4] → a₁
+logits[5] → a₂
+logits[6] → an unseen future token
+```
+
+The first answer token is at index 4 but is predicted by the logits at index 3, hence
+`start = len(prompt_ids) - 1`. The function averages token log-probabilities so that answers of
+different lengths can be compared more fairly. A sum would usually penalize a longer answer simply
+because it contains more negative terms.
+
+## 5. A single critique-refine experiment
+
+The experiment uses this problem:
+
+> Half the value of $3x-9$ is $x+37$. What is the value of $x$?
+
+The correct result is $x=83$, but the initial response under the fixed seed is:
+
+```text
+\boxed{18}
+```
+
+The critique prompt includes the original question and draft and asks the model to check for
+logical errors, missing steps, and arithmetic mistakes, followed by a concise fix plan. The model
+correctly works through $\frac{1}{2}(3x-9)=x+37$ and obtains $x=83$, although it also incorrectly
+claims that the question itself contains a logical error.
+
+This detail matters: a critique does not have to be completely correct to provide a useful signal
+for revision. The refine prompt then supplies the question, old answer, and critique and requires a
+final `\boxed{ANSWER}`. The model changes its response to:
+
+```text
+\boxed{83}
+```
+
+In this one example, self-critique supplies the calculation missing from the initial answer. It
+does not yet solve the harder problem of deciding automatically whether the rewrite is better.
+
+## 6. Building the iterative self-refinement loop
+
+The full loop keeps a current answer and score. Each iteration generates a critique and revision,
+then compares the revision with the accepted answer:
+
+```python
+for it in range(iterations):
+    critique_full = generate_text_stream_concat_flex(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=make_critique_prompt(raw_prompt, current_full),
+        device=device,
+        max_new_tokens=max_critique_tokens,
+        generate_func=generate_text_top_p_stream_cache,
+        temperature=temperature,
+        top_p=top_p,
+    )
+
+    revised_full = generate_text_stream_concat_flex(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=make_refine_prompt(raw_prompt, current_full, critique_full),
+        device=device,
+        max_new_tokens=max_response_tokens,
+        generate_func=generate_text_top_p_stream_cache,
+        temperature=temperature,
+        top_p=top_p,
+    )
+
+    revised_score = score_fn(answer=revised_full, prompt=prompt)
+    if revised_score >= current_score:
+        current_full = revised_full
+        current_score = revised_score
+```
+
+The loop also records the previous full answer, extracted result, critique, revision, and before and
+after scores so every decision can be audited. `functools.partial` binds the `model`, `tokenizer`,
+and `device` arguments of `avg_logprob_answer`, adapting it to the common
+`score_fn(answer, prompt)` interface.
+
+## 7. The central failure: likely does not mean correct
+
+Running three refinements with average answer log-probability produces:
+
+| Round | Current answer | Revision | Current score | Revision score |
+| ----- | -------------- | -------- | ------------- | -------------- |
+| 1     | `x=40`         | `x=83`   | -1.141        | -1.633         |
+| 2     | `x=40`         | `x=-1`   | -1.141        | -1.750         |
+| 3     | `x=40`         | `x=83`   | -1.141        | -1.375         |
+
+Because a value closer to zero is better, the scorer preserves the wrong `x=40` on every round.
+Even though the revision reaches the correct `x=83` twice, the loop still returns `x=40`.
+
+Average log-probability measures how natural the text is under the current model. It does not
+directly measure whether the reasoning is correct. It may also favor familiar phrasing, shorter
+answers, or wrong patterns that the model already believes confidently. A self-refinement system
+therefore has at least three distinct roles:
+
+| Role      | Job                                         | Typical failure                               |
+| --------- | ------------------------------------------- | --------------------------------------------- |
+| Generator | Produce drafts and revisions                | Arithmetic errors, early stops, bad format    |
+| Critic    | Identify errors and propose repairs         | False alarms, missed errors, incorrect advice |
+| Scorer    | Decide whether a revision is an improvement | Mistaking fluency or confidence for truth     |
+
+For verifiable mathematics, the symbolic or answer verifier from Chapter 3 is a better signal, or
+it can be combined with format and length rewards. Open-ended tasks may require a trained reward
+model, external tools, or human evaluation.
+
+## 8. How self-refinement relates to training
+
+This loop operates at inference time: model weights never change, and each round merely places a
+previous output back into the context. Its cost grows with the number of refinements, and an
+incorrect critique can also contaminate the next round.
+
+The same structure can nevertheless provide a training signal. One observation in my notebook was
+that it feels natural to use critiques for retraining. Systems such as
+[DeepSeekMath-V2](https://arxiv.org/abs/2511.22570) go further by training verifier or critic
+components and using generated critiques and verification data to improve mathematical reasoning.
+The key distinction is that inference-time refinement changes one response temporarily, while
+training writes feedback into parameters so that future problems may benefit too.
+
+## 9. What this chapter established
+
+1. A sequence likelihood is the product of the conditional probability at each next-token step.
+2. Implementations should sum values from `log_softmax` to avoid underflow in probability products.
+3. Causal-LM logits and target tokens are shifted by one position; answer scoring must respect that
+   alignment.
+4. Critique-refine prompting can repair an answer, but the critic can introduce false claims too.
+5. The acceptance rule determines whether a refinement takes effect; a weak scorer can reject a
+   correct revision.
+6. An answer that the model considers more likely is not necessarily more correct. Verifiable tasks
+   should use a verifier aligned with the real objective.
+
+The chapter's best lesson is not “reflect more and the model becomes smarter.” It is that
+**generation, criticism, and selection are separate problems, and a misaligned objective in any
+one of them can break the entire refinement loop.**

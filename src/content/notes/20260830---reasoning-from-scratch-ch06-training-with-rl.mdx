@@ -1,0 +1,369 @@
+---
+title: '用可验证奖励训练推理模型：Reasoning from Scratch 第 6 章笔记'
+description: '从 rollout、二值奖励和组内 advantage 出发，实现一个简化的 GRPO 风格策略梯度训练循环。'
+date: 2026-08-30
+tags:
+  - reasoning-models
+  - reinforcement-learning
+  - rlvr
+  - grpo
+  - policy-gradient
+  - qwen3
+  - book-notes
+language: 'zh-CN'
+type: note
+status: ready
+draft: false
+---
+
+> **来源与翻译说明**
+>
+> 本文是我学习 Sebastian Raschka 的 _Build a Reasoning Model (From Scratch)_ 第 6 章
+> “Training Reasoning Models with Reinforcement Learning” 时所做的笔记。代码来自我的章节
+> Notebook，并参考本书的
+> [官方配套仓库](https://github.com/rasbt/reasoning-from-scratch)；代码版权归原作者所有，并遵循
+> 该仓库的许可证。Codex 根据我的 Notebook 和其中的个人批注整理了这份初稿，并辅助完成中英文
+> 版本。本文只是我对学习过程的解释性记录，不能替代原书。
+
+前两章都在 inference time 改变模型行为：第 4 章采样多条推理轨迹，第 5 章让模型批评并改写答案。
+第 6 章终于更新模型权重。它使用 **reinforcement learning with verifiable rewards（RLVR）**：对
+数学题生成多条 rollout，用确定性的答案 verifier 给每条 rollout 打分，再提高高于组内平均水平的
+答案概率、降低低于平均水平的答案概率。
+
+```text
+一道训练题
+  → 从当前 policy 采样一组 responses
+  → verifier 给出 0/1 reward
+  → 在组内标准化为 advantages
+  → 重新计算每条 response 的 differentiable log-probability
+  → policy-gradient loss
+  → backward + optimizer step
+```
+
+Notebook 实现的是教学用途的 **GRPO-style simplified objective**。它展示了 group-relative advantage
+和 policy gradient 的核心数据流，但没有
+[DeepSeekMath 原始 GRPO 设计](https://arxiv.org/abs/2402.03300)中的 probability ratio、clipping、
+reference policy 或 KL penalty。理解这个边界很重要：它适合从零看清机制，不应与完整的
+production GRPO trainer 等同。
+
+## 1. 从 base model 和数学数据开始
+
+实验仍然加载 Qwen3 0.6B base model，并使用第 4 章的 temperature 与 top-p sampler。固定 seed
+后，模型对熟悉的方程题生成了错误答案：
+
+```text
+\boxed{34} \boxed{34}
+```
+
+训练数据来自 book companion workflow 使用的 MATH 子集，去除了 MATH-500 evaluation split。
+Notebook 下载后得到 12,000 个 example。每项包含：
+
+- `problem`：题目文本；
+- `answer`：用于 verifier 的简短 ground truth；
+- `solution`：参考解题过程；
+- `level`、`type` 和 `unique_id`：难度、类别与标识符。
+
+例如，索引 4 的题目问 Sam 在 20 天中有多少天没有工作，ground-truth answer 是 `6`。训练循环只
+需要 `problem` 和 `answer`：response 的奖励由最终答案是否匹配决定，不需要把参考 solution 喂给
+模型。
+
+## 2. 为什么 rollout sampling 使用 `no_grad()`
+
+`sample_response` 使用 KV cache 逐 token 采样，同时返回完整 token IDs、prompt 长度和解码文本：
+
+```python
+@torch.no_grad()
+def sample_response(
+    model,
+    tokenizer,
+    prompt,
+    device,
+    max_new_tokens=512,
+    temperature=0.8,
+    top_p=0.9,
+):
+    input_ids = torch.tensor(tokenizer.encode(prompt), device=device)
+    cache = KVCache(n_layers=model.cfg["n_layers"])
+    model.reset_kv_cache()
+    logits = model(input_ids.unsqueeze(0), cache=cache)[:, -1]
+
+    generated = []
+    for _ in range(max_new_tokens):
+        if temperature and temperature != 1.0:
+            logits = logits / temperature
+
+        probas = torch.softmax(logits, dim=-1)
+        probas = top_p_filter(probas, top_p)
+        next_token = torch.multinomial(
+            probas.cpu(), num_samples=1
+        ).to(device)
+
+        token_id = next_token.item()
+        generated.append(token_id)
+        if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
+            break
+        logits = model(next_token, cache=cache)[:, -1]
+
+    full_token_ids = torch.cat(
+        [
+            input_ids,
+            torch.tensor(generated, device=device, dtype=input_ids.dtype),
+        ]
+    )
+    return full_token_ids, input_ids.numel(), tokenizer.decode(generated)
+```
+
+这里特意使用 `@torch.no_grad()`，而不是第 4 章 generation function 中的
+`@torch.inference_mode()`。第 6 章实际会使用模型两次：
+
+```text
+1. 生成 response：不需要梯度
+2. 对同一 response 重新评分：建立 computation graph，然后 backward()
+```
+
+Sampling 本身经过离散 token ID 和随机抽样，gradient 不会穿过这个过程。`no_grad()` 避免在长
+generation 期间保存巨大的 graph，但它返回的普通 tensor 仍可在第二次 forward pass 中使用。
+
+`inference_mode()` 更严格：它创建的 tensor 会被标记为 inference tensor。之后 embedding layer
+若想保存这些 token IDs 用于 backward，PyTorch 可能抛出
+`Inference tensors cannot be saved for backward`。这里需要的是“现在不建 graph，但返回值之后仍可
+参与建图”，正好对应 `no_grad()`。
+
+## 3. CPU sampling 与 device transfer
+
+Notebook 明确地执行：
+
+```text
+accelerator 上的 probas
+  → probas.cpu()
+  → CPU 上 multinomial sampling
+  → next_token.to(device)
+  → accelerator 上继续 forward
+```
+
+`torch.multinomial()` 的输出与输入在同一 device，所以必须把 sampled token 移回 model 所在的
+device。这样写在 CPU、CUDA 和 MPS 环境之间更容易保持一致，但每个 token 都往返传输会拖慢
+generation。如果 accelerator 原生 sampling 工作正常，可以直接写：
+
+```python
+next_token = torch.multinomial(probas, num_samples=1)
+```
+
+这是 portability 与 throughput 之间的取舍，而不是算法本身的要求。
+
+## 4. RLVR：用 verifier 产生二值 reward
+
+RLVR 不需要训练一个主观 reward model。对于有唯一、可检查答案的数学题，可以复用第 3 章的
+answer extraction 和 grading：
+
+```python
+def reward_rlvr(answer_text, ground_truth):
+    extracted = extract_final_candidate(answer_text, fallback=None)
+    if not extracted:
+        return 0.0
+    correct = grade_answer(extracted, ground_truth)
+    return float(correct)
+```
+
+Notebook 构造了四条短 rollout：
+
+| Response                           | Reward |
+| ---------------------------------- | ------ |
+| `\boxed{83}`                       | 1.0    |
+| `The correct answer is \boxed{83}` | 1.0    |
+| `The final answer is 83`           | 0.0    |
+| `We get \boxed{38}`                | 0.0    |
+
+第三条在语义上给出了正确数字，却因为没有满足 strict boxed-answer contract 而得到 0。这既是 feature
+也是风险：严格格式让 reward 容易自动验证，却也可能让模型主要学习格式。Reward function 必须与
+训练目标一致，否则 policy 会被错误信号塑造。
+
+## 5. 从 reward 计算 group-relative advantage
+
+对同一 prompt 的 $N$ 条 rollout，将 reward 在组内标准化：
+
+$$
+A_i=\frac{r_i-\mu_r}{\sigma_r+\epsilon}.
+$$
+
+```python
+rewards = torch.tensor(rollout_rewards, device=device)
+advantages = (
+    (rewards - rewards.mean()) / (rewards.std() + 1e-4)
+)
+```
+
+对 rewards `[1, 1, 0, 0]`，Notebook 得到约：
+
+```text
+[ 0.8659,  0.8659, -0.8659, -0.8659]
+```
+
+绝对 reward 被转换为组内相对信号：正 advantage 表示该 rollout 比同组平均好，负 advantage 表示
+更差。这样不需要单独的 learned value model。
+
+但 group-relative signal 也有明显限制。如果一组 rollout 的 reward 全是 0，或者全是 1，那么
+每个 advantage 都是 0，policy-gradient loss 也为 0。这一步不会学习任何东西。因此，采样需要在
+同一组中产生足够的 reward variance。
+
+## 6. 重新计算可求导的 sequence log-probability
+
+Rollout 已在 `no_grad()` 下生成，训练时要把完整 token sequence 再送入当前 model，建立通向 model
+parameters 的 gradient path：
+
+```python
+def sequence_logprob(model, token_ids, prompt_len):
+    logits = model(token_ids.unsqueeze(0)).squeeze(0).float()
+    logprobs = torch.log_softmax(logits, dim=-1)
+    selected = logprobs[:-1].gather(
+        1, token_ids[1:].unsqueeze(-1)
+    ).squeeze(-1)
+    return torch.sum(selected[prompt_len - 1 :])
+```
+
+`logprobs[:-1]` 与 `token_ids[1:]` 对齐：位置 $t$ 的 logits 预测位置 $t+1$ 的 token。
+`gather` 沿 vocabulary dimension 取出实际 next token 的 log-probability，然后从
+`prompt_len - 1` 开始，只对 response token 求和。
+
+第 5 章为比较不同长度的候选答案使用 average log-probability；这里使用 sum，因为 policy-gradient
+objective 要累计整条 trajectory 上各 action 的 log-probability：
+
+$$
+\log\pi_\theta(y\mid x)
+=\sum_{t=1}^{T}\log\pi_\theta(y_t\mid y_{<t},x).
+$$
+
+Notebook 还比较了 explicit advanced indexing 和 `torch.gather`，两者得到相同结果；`gather` 更适合
+GPU 上的向量化实现。
+
+## 7. `.item()` 会切断 gradient，并可能同步 GPU
+
+`sequence_logprob` 返回类似下面的 tensor：
+
+```python
+tensor(-16.2998, device="cuda:0", grad_fn=<SumBackward0>)
+```
+
+`logprob.item()` 只取出普通 Python number，不再携带 gradient information。因此，构造 loss 时必须
+保留原 tensor，不能把 `.item()` 后的值塞回训练计算。
+
+此外，在 CUDA tensor 上调用 `.item()` 会把值复制到 CPU，并迫使 CPU 等待 GPU 完成相关工作。
+偶尔打印日志没有问题，但在高性能训练循环里频繁调用可能带来 synchronization overhead。本章的
+实现为教学清晰度返回一些 scalar `.item()`；真正优化吞吐量时，应减少 hot path 中的同步点。
+
+## 8. Policy-gradient loss
+
+对每条 rollout $i$，使用 advantage 给整条 response 的 log-probability 加权：
+
+$$
+L_{PG}
+=-\frac{1}{N}\sum_{i=1}^{N}
+A_i\sum_{t=1}^{T_i}
+\log\pi_\theta\left(y_t^{(i)}\mid y_{<t}^{(i)},x^{(i)}\right).
+$$
+
+实现只有两行：
+
+```python
+logps = torch.stack(rollout_logps)
+pg_loss = -(advantages.detach() * logps).mean()
+```
+
+- 当 $A_i>0$ 时，minimize loss 会提高该 rollout 的 log-probability。
+- 当 $A_i<0$ 时，会降低该 rollout 的 log-probability。
+- 前面的负号把“最大化 advantage-weighted log-probability”转换为 optimizer 默认执行的
+  minimization。
+
+### 为什么要 detach advantages？
+
+Advantage 是对 rollout 的固定反馈。Backward 应更新产生 `logps` 的 policy，而不是改变产生反馈的
+计算。`advantages.detach()` 明确切断这条路径。
+
+当前例子中的 reward 本来就是不带 gradient 的数字，所以 `detach()` 不改变数值结果；但如果之后
+用 learned value/reward model 计算 advantage，这个边界可以防止 policy loss 意外更新反馈网络。
+Value 或 reward component 应通过自己的 loss 单独训练。
+
+## 9. 组合为一次 simplified GRPO-style update
+
+`compute_grpo_loss` 对一条 example 执行整个流程：
+
+1. 渲染 problem prompt，并暂时把 model 切换到 evaluation behavior。
+2. 为同一 prompt 采样多条 rollout。
+3. 用 `reward_rlvr` 计算每条 response 的二值 reward。
+4. 重新 forward，获得可求导的 sequence log-probability。
+5. 将组内 rewards 标准化为 advantages。
+6. 构造 policy-gradient loss，同时保留 response 文本、reward 与生成长度用于诊断。
+
+Notebook 在训练前对 Sam 的题目采样两次，两条 reward 都是 0：
+
+```text
+rewards:    [0.0, 0.0]
+advantages: [0.0, 0.0]
+loss:       -0.0
+```
+
+这不是 bug，而是 group-relative learning signal 消失的直接例子。如果一组答案都一样差，算法无法
+仅凭相对排序指出改进方向。
+
+## 10. 训练循环、logging 与 checkpoints
+
+外层 training loop 使用 AdamW，并为每步执行：
+
+```python
+optimizer.zero_grad()
+stats = compute_grpo_loss(...)
+stats["loss_tensor"].backward()
+torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+optimizer.step()
+```
+
+Gradient clipping 把 global norm 限制在 1.0，降低大 update 破坏训练的风险。循环还把 step、loss、
+平均 reward 和平均 response length 追加到 CSV，并定期保存 state dict。`KeyboardInterrupt` 分支也会
+写一个 checkpoint，使长时间 rollout sampling 可以安全中止。
+
+本地 Notebook 配置为 50 steps、每题 4 条 rollout、最多 512 个新 token、temperature 0.8、
+top-p 0.9 和 learning rate $10^{-5}$。实际记录只运行到第 5 步：
+
+```text
+[Step 1/50] loss=-0.0000 reward_avg=0.000 avg_resp_len=6.2
+[Step 2/50] loss=-0.0000 reward_avg=0.000 avg_resp_len=6.8
+[Step 3/50] loss=6.4440  reward_avg=0.500 avg_resp_len=61.0
+[Step 4/50] loss=3.4684  reward_avg=0.750 avg_resp_len=114.2
+[Step 5/50] loss=-0.0000 reward_avg=0.000 avg_resp_len=168.0
+```
+
+这些数字只能用于验证 pipeline 是否运转，不能说明模型已经提升。Notebook 随后开始下载官方
+step-50 checkpoint，但输出停在 34%，没有完成 evaluation。因此，这份笔记不声称 final accuracy
+改善。正式评估需要完整 checkpoint、固定 evaluation split、base-model baseline，以及 accuracy、
+response length 和 compute cost 的共同报告。
+
+## 11. 实现边界与实际改进方向
+
+这个最小实现把 RLVR 的核心连接起来了，但还有若干重要限制：
+
+| 当前实现                             | 更完整的 trainer 通常还需要                  |
+| ------------------------------------ | -------------------------------------------- |
+| 直接使用当前 policy 的 sequence logp | old/new policy ratio                         |
+| 无 ratio clipping                    | PPO/GRPO-style clipped surrogate objective   |
+| 无 reference policy                  | KL penalty 或其他 drift control              |
+| response-level binary advantage      | 更细粒度 reward、masking 或 token weighting  |
+| 每条 rollout 单独 forward            | batched generation 与 batched scoring        |
+| 组内 reward 相同时零 gradient        | 更大 group、课程设计或更丰富的 reward signal |
+
+此外，checkpoint filename 和加载约定必须统一，训练数据与 evaluation data 必须严格隔离，所有训练
+实验都应记录 seed、model state、sampler 参数和 verifier 版本。
+
+## 12. 本章的核心结论
+
+1. RLVR 用可程序验证的答案代替主观 reward model，特别适合数学和代码等任务。
+2. Rollout generation 不需要 gradient，但生成出的 token IDs 必须能在随后的训练 forward 中复用；
+   因此这里使用 `no_grad()` 而非 `inference_mode()`。
+3. Group-relative advantages 表示同一 prompt 下 response 的相对质量，不需要 learned critic。
+4. 如果组内 reward 没有 variance，所有 advantage 都为 0，这一步不会产生 learning signal。
+5. Policy gradient 通过 advantage-weighted sequence log-probability，提高好 rollout 的概率并降低差
+   rollout 的概率。
+6. `.detach()` 固定 feedback，`.item()` 只适合 logging，不能进入需要 gradient 的 loss path。
+7. Notebook 的 loss 是理解机制的最小版本，不是完整 GRPO objective；短暂训练日志也不是性能结论。
+
+从第 4 章的 sampling 到第 5 章的 scoring，再到本章的 optimization，整个链条终于闭合：模型先
+探索多个答案，verifier 把结果转换为信号，policy gradient 再把这个信号写回参数。

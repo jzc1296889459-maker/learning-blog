@@ -1,0 +1,394 @@
+---
+title: 'Training a Reasoning Model with Verifiable Rewards: Chapter 6 Notes'
+description: 'Building a simplified GRPO-style policy-gradient loop from rollouts, binary rewards, and group-relative advantages.'
+date: 2026-08-30
+tags:
+  - reasoning-models
+  - reinforcement-learning
+  - rlvr
+  - grpo
+  - policy-gradient
+  - qwen3
+  - book-notes
+language: 'en'
+translationKey: '20260830---reasoning-from-scratch-ch06-training-with-rl'
+type: note
+status: ready
+draft: false
+---
+
+> **Source note**
+>
+> This is my study note for Chapter 6, “Training Reasoning Models with Reinforcement Learning,”
+> of Sebastian Raschka's _Build a Reasoning Model (From Scratch)_. The code follows my chapter
+> notebook and the book's
+> [official companion repository](https://github.com/rasbt/reasoning-from-scratch). The code
+> remains the author's work under the repository's license. Codex organized this draft from my
+> notebook and my annotations and assisted with the Chinese version. This is an explanatory record
+> of my study and does not replace the book.
+
+The previous two chapters changed model behavior at inference time. Chapter 4 sampled several
+reasoning paths, and Chapter 5 asked the model to criticize and revise an answer. Chapter 6 finally
+updates the model weights. It uses **reinforcement learning with verifiable rewards (RLVR)**:
+generate a group of rollouts for a math problem, score each with a deterministic answer verifier,
+then increase the probability of answers above the group average and decrease the probability of
+those below it.
+
+```text
+one training problem
+  → sample a group of responses from the current policy
+  → assign 0/1 rewards with a verifier
+  → normalize rewards into group-relative advantages
+  → recompute differentiable response log-probabilities
+  → policy-gradient loss
+  → backward + optimizer step
+```
+
+The notebook implements a teaching-oriented **simplified GRPO-style objective**. It exposes the
+essential data flow between group-relative advantages and policy gradients, but it does not include
+the probability ratio, clipping, reference policy, or KL penalty in the
+[original DeepSeekMath GRPO design](https://arxiv.org/abs/2402.03300). It is useful for seeing the
+mechanism from scratch, not a drop-in equivalent of a production GRPO trainer.
+
+## 1. Starting with a base model and math data
+
+The experiment again loads the Qwen3 0.6B base model and uses the temperature and top-p sampler
+from Chapter 4. Under a fixed seed, the model answers the familiar equation problem incorrectly:
+
+```text
+\boxed{34} \boxed{34}
+```
+
+The training data is the MATH subset used by the book's companion workflow, with the MATH-500
+evaluation split removed. The notebook loads 12,000 examples. Each contains:
+
+- `problem`: the question text;
+- `answer`: a short ground truth for the verifier;
+- `solution`: a reference derivation;
+- `level`, `type`, and `unique_id`: difficulty, category, and identity metadata.
+
+For example, item 4 asks how many days Sam did not work during a 20-day period and has the answer
+`6`. The training loop needs only `problem` and `answer`: it rewards whether the final answer
+matches and does not show the reference solution to the model.
+
+## 2. Why rollout sampling uses `no_grad()`
+
+`sample_response` uses a KV cache to sample one token at a time and returns the full token IDs,
+prompt length, and decoded response:
+
+```python
+@torch.no_grad()
+def sample_response(
+    model,
+    tokenizer,
+    prompt,
+    device,
+    max_new_tokens=512,
+    temperature=0.8,
+    top_p=0.9,
+):
+    input_ids = torch.tensor(tokenizer.encode(prompt), device=device)
+    cache = KVCache(n_layers=model.cfg["n_layers"])
+    model.reset_kv_cache()
+    logits = model(input_ids.unsqueeze(0), cache=cache)[:, -1]
+
+    generated = []
+    for _ in range(max_new_tokens):
+        if temperature and temperature != 1.0:
+            logits = logits / temperature
+
+        probas = torch.softmax(logits, dim=-1)
+        probas = top_p_filter(probas, top_p)
+        next_token = torch.multinomial(
+            probas.cpu(), num_samples=1
+        ).to(device)
+
+        token_id = next_token.item()
+        generated.append(token_id)
+        if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
+            break
+        logits = model(next_token, cache=cache)[:, -1]
+
+    full_token_ids = torch.cat(
+        [
+            input_ids,
+            torch.tensor(generated, device=device, dtype=input_ids.dtype),
+        ]
+    )
+    return full_token_ids, input_ids.numel(), tokenizer.decode(generated)
+```
+
+The deliberate choice here is `@torch.no_grad()` instead of the
+`@torch.inference_mode()` used by the Chapter 4 generation function. Chapter 6 uses the model
+twice:
+
+```text
+1. Generate a response: no gradients needed
+2. Rescore the response: build a graph and call backward()
+```
+
+Sampling passes through discrete token IDs and a random draw, so gradients do not propagate
+through it. `no_grad()` avoids retaining an enormous graph during generation while returning
+ordinary tensors that can still be consumed by the second forward pass.
+
+`inference_mode()` is stricter: tensors created under it are marked as inference tensors. If an
+embedding layer later tries to save those token IDs for backward, PyTorch can raise
+`Inference tensors cannot be saved for backward`. The requirement here is “do not build a graph
+now, but allow these outputs to participate in one later,” which is exactly what `no_grad()` gives
+us.
+
+## 3. CPU sampling and device transfers
+
+The notebook explicitly performs this round trip:
+
+```text
+probas on the accelerator
+  → probas.cpu()
+  → multinomial sampling on the CPU
+  → next_token.to(device)
+  → continue the forward pass on the accelerator
+```
+
+`torch.multinomial()` returns a tensor on the same device as its input, so the sampled token must be
+moved back to the model's device. This pattern is portable across CPU, CUDA, and MPS, but a transfer
+on every token slows generation. If sampling works directly on the accelerator, the two transfers
+can be removed:
+
+```python
+next_token = torch.multinomial(probas, num_samples=1)
+```
+
+This is a portability-throughput tradeoff, not an algorithmic requirement.
+
+## 4. RLVR: producing binary rewards with a verifier
+
+RLVR does not require a learned model for subjective scoring. A math problem with a unique,
+checkable answer can reuse the extraction and grading pipeline from Chapter 3:
+
+```python
+def reward_rlvr(answer_text, ground_truth):
+    extracted = extract_final_candidate(answer_text, fallback=None)
+    if not extracted:
+        return 0.0
+    correct = grade_answer(extracted, ground_truth)
+    return float(correct)
+```
+
+The notebook constructs four short rollouts:
+
+| Response                           | Reward |
+| ---------------------------------- | ------ |
+| `\boxed{83}`                       | 1.0    |
+| `The correct answer is \boxed{83}` | 1.0    |
+| `The final answer is 83`           | 0.0    |
+| `We get \boxed{38}`                | 0.0    |
+
+The third response gives the semantically correct number but earns zero because it violates the
+strict boxed-answer contract. This is both a feature and a risk: strict formatting makes rewards
+easy to verify, but the model may primarily learn the format. A reward function must match the
+training objective, or the policy will be shaped by the wrong signal.
+
+## 5. Computing group-relative advantages
+
+For $N$ rollouts from one prompt, rewards are standardized within the group:
+
+$$
+A_i=\frac{r_i-\mu_r}{\sigma_r+\epsilon}.
+$$
+
+```python
+rewards = torch.tensor(rollout_rewards, device=device)
+advantages = (
+    (rewards - rewards.mean()) / (rewards.std() + 1e-4)
+)
+```
+
+For rewards `[1, 1, 0, 0]`, the notebook obtains approximately:
+
+```text
+[ 0.8659,  0.8659, -0.8659, -0.8659]
+```
+
+Absolute rewards become relative signals within the group. A positive advantage means that a
+rollout performed above the group average, while a negative one means that it performed below it.
+No separate learned value model is required.
+
+Group-relative feedback also has a clear limitation. If every rollout receives zero—or every one
+receives one—then every advantage is zero and so is the policy-gradient loss. That step learns
+nothing. Sampling must produce enough reward variance inside a group.
+
+## 6. Recomputing differentiable sequence log-probabilities
+
+The rollout was generated under `no_grad()`. For training, the full token sequence is sent through
+the current model again to build a gradient path to its parameters:
+
+```python
+def sequence_logprob(model, token_ids, prompt_len):
+    logits = model(token_ids.unsqueeze(0)).squeeze(0).float()
+    logprobs = torch.log_softmax(logits, dim=-1)
+    selected = logprobs[:-1].gather(
+        1, token_ids[1:].unsqueeze(-1)
+    ).squeeze(-1)
+    return torch.sum(selected[prompt_len - 1 :])
+```
+
+`logprobs[:-1]` aligns with `token_ids[1:]`: logits at position $t$ predict the token at position
+$t+1$. `gather` selects the observed next token along the vocabulary dimension. Slicing from
+`prompt_len - 1` keeps only response-token predictions.
+
+Chapter 5 used an average log-probability to compare candidates of different lengths. Here we use a
+sum because the policy-gradient objective accumulates action log-probabilities over the entire
+trajectory:
+
+$$
+\log\pi_\theta(y\mid x)
+=\sum_{t=1}^{T}\log\pi_\theta(y_t\mid y_{<t},x).
+$$
+
+The notebook compares explicit advanced indexing with `torch.gather` and obtains the same result.
+`gather` is the more convenient vectorized implementation for the GPU.
+
+## 7. `.item()` breaks the gradient path and may synchronize the GPU
+
+`sequence_logprob` returns a tensor like:
+
+```python
+tensor(-16.2998, device="cuda:0", grad_fn=<SumBackward0>)
+```
+
+`logprob.item()` extracts an ordinary Python number with no gradient information. The original
+tensor must therefore be retained when constructing the loss; a value returned by `.item()` cannot
+be inserted back into the differentiable training calculation.
+
+Calling `.item()` on a CUDA tensor also copies the value to the CPU and forces the CPU to wait for
+the relevant GPU work. Occasional notebook logging is fine, but frequent calls in a high-throughput
+training loop can create synchronization overhead. This teaching implementation returns a few
+scalar `.item()` values for clarity; an optimized trainer should minimize synchronization points in
+its hot path.
+
+## 8. The policy-gradient loss
+
+For rollout $i$, its advantage weights the log-probability of the entire response:
+
+$$
+L_{PG}
+=-\frac{1}{N}\sum_{i=1}^{N}
+A_i\sum_{t=1}^{T_i}
+\log\pi_\theta\left(y_t^{(i)}\mid y_{<t}^{(i)},x^{(i)}\right).
+$$
+
+The implementation takes two lines:
+
+```python
+logps = torch.stack(rollout_logps)
+pg_loss = -(advantages.detach() * logps).mean()
+```
+
+- If $A_i>0$, minimizing the loss increases that rollout's log-probability.
+- If $A_i<0$, it decreases that rollout's log-probability.
+- The leading minus sign converts the desired maximization of advantage-weighted log-probability
+  into the minimization expected by the optimizer.
+
+### Why detach the advantages?
+
+An advantage is fixed feedback about a rollout. Backward should update the policy that produced
+`logps`, not the calculation that produced the feedback. `advantages.detach()` makes that boundary
+explicit.
+
+The rewards in this example are already plain numbers with no gradient history, so detaching does
+not change the numerical result. If a learned value or reward model later computes the advantage,
+however, the boundary prevents the policy loss from accidentally updating that network. Value and
+reward components should be trained separately with their own losses.
+
+## 9. Combining the pieces into one simplified GRPO-style update
+
+`compute_grpo_loss` executes the full process for one example:
+
+1. Render the problem prompt and temporarily place the model in evaluation behavior.
+2. Sample several rollouts for that same prompt.
+3. Compute a binary `reward_rlvr` for each response.
+4. Run another forward pass to obtain differentiable sequence log-probabilities.
+5. Standardize the group rewards into advantages.
+6. Build the policy-gradient loss while retaining response text, rewards, and generation lengths
+   for diagnosis.
+
+Before training, the notebook samples two answers for the Sam problem and both receive zero:
+
+```text
+rewards:    [0.0, 0.0]
+advantages: [0.0, 0.0]
+loss:       -0.0
+```
+
+This is not a bug. It directly demonstrates the loss of group-relative learning signal. If every
+answer is equally bad, the algorithm cannot infer a better direction from relative ranking alone.
+
+## 10. Training loop, logging, and checkpoints
+
+The outer loop uses AdamW and performs the usual update on each step:
+
+```python
+optimizer.zero_grad()
+stats = compute_grpo_loss(...)
+stats["loss_tensor"].backward()
+torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+optimizer.step()
+```
+
+Gradient clipping limits the global norm to 1.0 and reduces the risk of a large update destabilizing
+training. The loop appends the step, loss, average reward, and average response length to a CSV and
+saves model state dictionaries periodically. Its `KeyboardInterrupt` handler also writes a
+checkpoint so a long rollout job can be stopped safely.
+
+The local notebook configures 50 steps, four rollouts per problem, at most 512 new tokens,
+temperature 0.8, top-p 0.9, and a learning rate of $10^{-5}$. Its recorded run stops after step 5:
+
+```text
+[Step 1/50] loss=-0.0000 reward_avg=0.000 avg_resp_len=6.2
+[Step 2/50] loss=-0.0000 reward_avg=0.000 avg_resp_len=6.8
+[Step 3/50] loss=6.4440  reward_avg=0.500 avg_resp_len=61.0
+[Step 4/50] loss=3.4684  reward_avg=0.750 avg_resp_len=114.2
+[Step 5/50] loss=-0.0000 reward_avg=0.000 avg_resp_len=168.0
+```
+
+These numbers only confirm that the pipeline executes; they do not establish model improvement.
+The notebook then begins downloading the official step-50 checkpoint, but its output ends at 34%
+without an evaluation. This note therefore makes no claim about final accuracy gains. A proper
+comparison needs a complete checkpoint, a fixed evaluation split, a base-model baseline, and joint
+reporting of accuracy, response length, and compute cost.
+
+## 11. Implementation boundaries and next steps
+
+This minimal implementation connects the essential RLVR pieces, but it has important limitations:
+
+| Current implementation                 | A fuller trainer commonly adds                     |
+| -------------------------------------- | -------------------------------------------------- |
+| Direct current-policy sequence logp    | Old/new policy probability ratio                   |
+| No ratio clipping                      | PPO/GRPO-style clipped surrogate objective         |
+| No reference policy                    | KL penalty or another form of drift control        |
+| Response-level binary advantage        | Finer rewards, masks, or token weighting           |
+| One forward pass per rollout           | Batched generation and batched scoring             |
+| Zero gradient for uniform group reward | Larger groups, curriculum, or richer reward signal |
+
+Checkpoint naming and loading conventions should also stay consistent. Training and evaluation
+data must be strictly separated, and every experiment should record its random seed, model state,
+sampling parameters, and verifier version.
+
+## 12. What this chapter established
+
+1. RLVR replaces a subjective reward model with programmatically verifiable answers and fits tasks
+   such as mathematics and code especially well.
+2. Rollout generation needs no gradient, but its token IDs must be reusable in the later training
+   forward pass; that is why this code uses `no_grad()` rather than `inference_mode()`.
+3. Group-relative advantages express response quality within one prompt without a learned critic.
+4. If group rewards have no variance, every advantage is zero and that step has no learning signal.
+5. Policy gradient uses advantage-weighted sequence log-probability to raise the probability of
+   good rollouts and lower the probability of bad ones.
+6. `.detach()` fixes the feedback signal, while `.item()` is for logging and must not enter a loss
+   path that needs gradients.
+7. The notebook loss is a minimal mechanism demonstration, not a full GRPO objective, and a short
+   training trace is not a performance result.
+
+The arc from Chapter 4's sampling through Chapter 5's scoring finally closes with optimization:
+the model explores several answers, a verifier converts outcomes into signals, and policy gradient
+writes those signals back into the parameters.
