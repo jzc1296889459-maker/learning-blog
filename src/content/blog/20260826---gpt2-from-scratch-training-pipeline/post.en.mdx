@@ -1,0 +1,1788 @@
+---
+title: 'GPT-2 From Scratch: A Streamlined Training Pipeline'
+description: 'A compact, executable path through Chapters 2–7: build and pretrain GPT-2, then branch into classification and instruction fine-tuning.'
+publishDate: 2026-08-26
+tags:
+  - llm
+  - gpt-2
+  - pytorch
+  - from-scratch
+language: 'en'
+translationKey: '20260826---gpt2-from-scratch-training-pipeline/post'
+tocDepth: 3
+draft: false
+comment: false
+---
+
+This post rearranges the essential code from Chapters 2–7 of _Build a Large Language Model (From Scratch)_ into one continuous path. Chapter 1 is only a roadmap and has no executable notebook. Chapters 2–5 build and pretrain an educational GPT-2, then two practical tasks start from fresh official checkpoints.
+
+- Main path: Chapter 1 roadmap → Chapter 2 text data → Chapter 3 attention → Chapter 4 `GPTModel` → Chapter 5 pretraining and checkpoints
+- Classification branch: fresh official GPT-2 124M → Chapter 6 SMS classification fine-tuning
+- Instruction branch: fresh official GPT-2 355M → Chapter 7 instruction fine-tuning
+
+The post retains every code cell without adding line-by-line commentary. Selected outputs are shown after the relevant cells; the full executed run remains in the [downloadable notebook](/notebooks/gpt2-from-scratch-training-pipeline.ipynb).
+
+## Detailed chapter notes
+
+- [Chapter 2: text data](/en/notes/20260817---llm-from-scratch-ch02-text-data)
+- [Chapter 3: attention](/en/notes/20260817---llm-from-scratch-ch03-attention)
+- [Chapter 4: the GPT model](/en/notes/20260817---llm-from-scratch-ch04-gpt-model)
+- [Chapter 5: pretraining and weight loading](/en/notes/20260820---llm-from-scratch-ch05-pretraining)
+- [Chapter 6: classification fine-tuning](/en/notes/20260820---llm-from-scratch-ch06-classification)
+- [Chapter 7: instruction fine-tuning](/en/notes/20260822---llm-from-scratch-ch07-instruction-finetuning)
+
+## Full code transcript
+
+### 0. Environment and pipeline overview
+
+```python
+import gc
+import json
+import os
+import platform
+import re
+import time
+import urllib.request
+import zipfile
+from functools import partial
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+
+import numpy as np
+import pandas as pd
+import requests
+import tiktoken
+import torch
+import torch._dynamo
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+
+
+SEED = 123
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+RUN_DIR = Path("gpt2-pipeline-run")
+DATA_DIR = RUN_DIR / "data"
+MODEL_DIR = RUN_DIR / "gpt2"
+ARTIFACT_DIR = RUN_DIR / "artifacts"
+for directory in (DATA_DIR, MODEL_DIR, ARTIFACT_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("TIKTOKEN_CACHE_DIR", str(DATA_DIR / "tiktoken-cache"))
+
+
+def download_url(url, destination):
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() and destination.stat().st_size > 0:
+        return
+    temporary_path = destination.with_name(destination.name + ".part")
+    urllib.request.urlretrieve(url, temporary_path)
+    temporary_path.replace(destination)
+
+
+def package_version(package_name):
+    try:
+        return version(package_name)
+    except PackageNotFoundError:
+        return "not installed"
+
+
+print(f"Python: {platform.python_version()}")
+print(f"PyTorch: {torch.__version__}")
+print(f"tiktoken: {package_version('tiktoken')}")
+print(f"NumPy: {np.__version__}")
+print(f"pandas: {pd.__version__}")
+print(f"TensorFlow: {package_version('tensorflow')}")
+print(f"Device: {device}")
+if torch.cuda.is_available():
+    print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+print(f"Working directory: {RUN_DIR}")
+```
+
+Output:
+
+```text
+Python: 3.11.9
+PyTorch: 2.13.0+cu126
+tiktoken: 0.13.0
+NumPy: 2.4.6
+pandas: 3.0.5
+TensorFlow: 2.21.0
+Device: cuda
+CUDA device: NVIDIA GeForce RTX 4060 Laptop GPU
+Working directory: gpt2-pipeline-run
+```
+
+### 1. Chapter 2: tokenization and sliding-window data
+
+```python
+VERDICT_URL = (
+    "https://raw.githubusercontent.com/rasbt/LLMs-from-scratch/"
+    "main/ch02/01_main-chapter-code/the-verdict.txt"
+)
+VERDICT_PATH = DATA_DIR / "the-verdict.txt"
+
+download_url(VERDICT_URL, VERDICT_PATH)
+
+text_data = VERDICT_PATH.read_text(encoding="utf-8")
+tokenizer = tiktoken.get_encoding("gpt2")
+
+
+class GPTDatasetV1(Dataset):
+    def __init__(self, text, tokenizer, max_length, stride):
+        self.input_ids = []
+        self.target_ids = []
+        token_ids = tokenizer.encode(
+            text, allowed_special={"<|endoftext|>"}
+        )
+
+        for index in range(0, len(token_ids) - max_length, stride):
+            input_chunk = token_ids[index : index + max_length]
+            target_chunk = token_ids[index + 1 : index + max_length + 1]
+            self.input_ids.append(torch.tensor(input_chunk))
+            self.target_ids.append(torch.tensor(target_chunk))
+
+    def __len__(self):
+        return len(self.input_ids)
+
+    def __getitem__(self, index):
+        return self.input_ids[index], self.target_ids[index]
+
+
+def create_dataloader_v1(
+    text,
+    batch_size=4,
+    max_length=256,
+    stride=128,
+    shuffle=True,
+    drop_last=True,
+    num_workers=0,
+):
+    dataset = GPTDatasetV1(text, tokenizer, max_length, stride)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=drop_last,
+        num_workers=num_workers,
+    )
+
+
+GPT_CONFIG_124M = {
+    "vocab_size": 50257,
+    "context_length": 256,
+    "emb_dim": 768,
+    "n_heads": 12,
+    "n_layers": 12,
+    "drop_rate": 0.1,
+    "qkv_bias": False,
+}
+
+split_index = int(len(text_data) * 0.9)
+pretrain_train_data = text_data[:split_index]
+pretrain_val_data = text_data[split_index:]
+
+torch.manual_seed(SEED)
+pretrain_train_loader = create_dataloader_v1(
+    pretrain_train_data,
+    batch_size=2,
+    max_length=GPT_CONFIG_124M["context_length"],
+    stride=GPT_CONFIG_124M["context_length"],
+    shuffle=True,
+    drop_last=True,
+)
+pretrain_val_loader = create_dataloader_v1(
+    pretrain_val_data,
+    batch_size=2,
+    max_length=GPT_CONFIG_124M["context_length"],
+    stride=GPT_CONFIG_124M["context_length"],
+    shuffle=False,
+    drop_last=False,
+)
+
+print(
+    f"Corpus: {len(text_data):,} characters / "
+    f"{len(tokenizer.encode(text_data)):,} tokens"
+)
+print(
+    f"Sliding-window batches: {len(pretrain_train_loader)} train / "
+    f"{len(pretrain_val_loader)} validation"
+)
+print(f"Sequence length: {GPT_CONFIG_124M['context_length']} tokens")
+```
+
+Output:
+
+```text
+Corpus: 20,479 characters / 5,145 tokens
+Sliding-window batches: 9 train / 1 validation
+Sequence length: 256 tokens
+```
+
+### 2. Chapter 3: multi-head causal attention
+
+```python
+class MultiHeadAttention(nn.Module):
+    def __init__(
+        self,
+        d_in,
+        d_out,
+        context_length,
+        dropout,
+        num_heads,
+        qkv_bias=False,
+    ):
+        super().__init__()
+        if d_out % num_heads != 0:
+            raise ValueError("d_out must be divisible by num_heads")
+
+        self.d_out = d_out
+        self.num_heads = num_heads
+        self.head_dim = d_out // num_heads
+
+        self.W_query = nn.Linear(d_in, d_out, bias=qkv_bias)
+        self.W_key = nn.Linear(d_in, d_out, bias=qkv_bias)
+        self.W_value = nn.Linear(d_in, d_out, bias=qkv_bias)
+        self.out_proj = nn.Linear(d_out, d_out)
+        self.dropout = nn.Dropout(dropout)
+        self.register_buffer(
+            "mask",
+            torch.triu(
+                torch.ones(context_length, context_length), diagonal=1
+            ),
+        )
+
+    def forward(self, x):
+        batch_size, num_tokens, _ = x.shape
+
+        keys = self.W_key(x)
+        queries = self.W_query(x)
+        values = self.W_value(x)
+
+        keys = keys.view(
+            batch_size, num_tokens, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        queries = queries.view(
+            batch_size, num_tokens, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        values = values.view(
+            batch_size, num_tokens, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+
+        attention_scores = queries @ keys.transpose(2, 3)
+        causal_mask = self.mask.bool()[:num_tokens, :num_tokens]
+        attention_scores.masked_fill_(causal_mask, -torch.inf)
+
+        attention_weights = torch.softmax(
+            attention_scores / keys.shape[-1] ** 0.5, dim=-1
+        )
+        attention_weights = self.dropout(attention_weights)
+
+        context = (attention_weights @ values).transpose(1, 2)
+        context = context.reshape(batch_size, num_tokens, self.d_out)
+        return self.out_proj(context)
+```
+
+### 3. Chapter 4: GPT-2 architecture and generation
+
+```python
+class LayerNorm(nn.Module):
+    def __init__(self, embedding_dimension):
+        super().__init__()
+        self.epsilon = 1e-5
+        self.scale = nn.Parameter(torch.ones(embedding_dimension))
+        self.shift = nn.Parameter(torch.zeros(embedding_dimension))
+
+    def forward(self, x):
+        mean = x.mean(dim=-1, keepdim=True)
+        variance = x.var(dim=-1, keepdim=True, unbiased=False)
+        normalized = (x - mean) / torch.sqrt(variance + self.epsilon)
+        return self.scale * normalized + self.shift
+
+
+class GELU(nn.Module):
+    def forward(self, x):
+        coefficient = torch.sqrt(
+            torch.tensor(2.0 / torch.pi, device=x.device)
+        )
+        return 0.5 * x * (
+            1 + torch.tanh(coefficient * (x + 0.044715 * x.pow(3)))
+        )
+
+
+class FeedForward(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(config["emb_dim"], 4 * config["emb_dim"]),
+            GELU(),
+            nn.Linear(4 * config["emb_dim"], config["emb_dim"]),
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.att = MultiHeadAttention(
+            d_in=config["emb_dim"],
+            d_out=config["emb_dim"],
+            context_length=config["context_length"],
+            dropout=config["drop_rate"],
+            num_heads=config["n_heads"],
+            qkv_bias=config["qkv_bias"],
+        )
+        self.ff = FeedForward(config)
+        self.norm1 = LayerNorm(config["emb_dim"])
+        self.norm2 = LayerNorm(config["emb_dim"])
+        self.drop_shortcut = nn.Dropout(config["drop_rate"])
+
+    def forward(self, x):
+        shortcut = x
+        x = self.norm1(x)
+        x = self.drop_shortcut(self.att(x))
+        x = x + shortcut
+
+        shortcut = x
+        x = self.norm2(x)
+        x = self.drop_shortcut(self.ff(x))
+        return x + shortcut
+
+
+class GPTModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.tok_emb = nn.Embedding(
+            config["vocab_size"], config["emb_dim"]
+        )
+        self.pos_emb = nn.Embedding(
+            config["context_length"], config["emb_dim"]
+        )
+        self.drop_emb = nn.Dropout(config["drop_rate"])
+        self.trf_blocks = nn.Sequential(
+            *[
+                TransformerBlock(config)
+                for _ in range(config["n_layers"])
+            ]
+        )
+        self.final_norm = LayerNorm(config["emb_dim"])
+        self.out_head = nn.Linear(
+            config["emb_dim"], config["vocab_size"], bias=False
+        )
+
+    def forward(self, token_ids):
+        _, sequence_length = token_ids.shape
+        token_embeddings = self.tok_emb(token_ids)
+        position_embeddings = self.pos_emb(
+            torch.arange(sequence_length, device=token_ids.device)
+        )
+        x = self.drop_emb(token_embeddings + position_embeddings)
+        x = self.trf_blocks(x)
+        x = self.final_norm(x)
+        return self.out_head(x)
+
+
+def text_to_token_ids(text, tokenizer):
+    encoded = tokenizer.encode(
+        text, allowed_special={"<|endoftext|>"}
+    )
+    return torch.tensor(encoded).unsqueeze(0)
+
+
+def token_ids_to_text(token_ids, tokenizer):
+    return tokenizer.decode(token_ids.squeeze(0).tolist())
+
+
+def generate_text_simple(model, token_ids, max_new_tokens, context_size):
+    for _ in range(max_new_tokens):
+        context = token_ids[:, -context_size:]
+        with torch.no_grad():
+            logits = model(context)
+        next_token = torch.argmax(
+            logits[:, -1, :], dim=-1, keepdim=True
+        )
+        token_ids = torch.cat((token_ids, next_token), dim=1)
+    return token_ids
+```
+
+### 4. Chapter 5: loss, generation, and educational pretraining
+
+```python
+def calc_lm_loss_batch(input_batch, target_batch, model, device):
+    input_batch = input_batch.to(device)
+    target_batch = target_batch.to(device)
+    logits = model(input_batch)
+    return torch.nn.functional.cross_entropy(
+        logits.flatten(0, 1), target_batch.flatten()
+    )
+
+
+def calc_lm_loss_loader(
+    data_loader, model, device, num_batches=None
+):
+    if len(data_loader) == 0:
+        return float("nan")
+
+    num_batches = (
+        len(data_loader)
+        if num_batches is None
+        else min(num_batches, len(data_loader))
+    )
+    total_loss = 0.0
+    for batch_index, (input_batch, target_batch) in enumerate(data_loader):
+        if batch_index >= num_batches:
+            break
+        loss = calc_lm_loss_batch(
+            input_batch, target_batch, model, device
+        )
+        total_loss += loss.item()
+    return total_loss / num_batches
+
+
+def evaluate_lm(
+    model, train_loader, val_loader, device, eval_iterations
+):
+    model.eval()
+    with torch.no_grad():
+        train_loss = calc_lm_loss_loader(
+            train_loader,
+            model,
+            device,
+            num_batches=eval_iterations,
+        )
+        validation_loss = calc_lm_loss_loader(
+            val_loader,
+            model,
+            device,
+            num_batches=eval_iterations,
+        )
+    model.train()
+    return train_loss, validation_loss
+
+
+def train_lm_simple(
+    model,
+    train_loader,
+    val_loader,
+    optimizer,
+    device,
+    num_epochs,
+    eval_frequency,
+    eval_iterations,
+):
+    train_losses, validation_losses, tokens_seen = [], [], []
+    token_count, global_step = 0, -1
+
+    for _ in range(num_epochs):
+        model.train()
+        for input_batch, target_batch in train_loader:
+            optimizer.zero_grad()
+            loss = calc_lm_loss_batch(
+                input_batch, target_batch, model, device
+            )
+            loss.backward()
+            optimizer.step()
+            token_count += input_batch.numel()
+            global_step += 1
+
+            if global_step % eval_frequency == 0:
+                train_loss, validation_loss = evaluate_lm(
+                    model,
+                    train_loader,
+                    val_loader,
+                    device,
+                    eval_iterations,
+                )
+                train_losses.append(train_loss)
+                validation_losses.append(validation_loss)
+                tokens_seen.append(token_count)
+
+    return train_losses, validation_losses, tokens_seen
+
+
+def generate(
+    model,
+    token_ids,
+    max_new_tokens,
+    context_size,
+    temperature=0.0,
+    top_k=None,
+    eos_id=None,
+):
+    for _ in range(max_new_tokens):
+        context = token_ids[:, -context_size:]
+        with torch.no_grad():
+            logits = model(context)
+        logits = logits[:, -1, :]
+
+        if top_k is not None:
+            top_logits, _ = torch.topk(logits, top_k)
+            threshold = top_logits[:, -1].unsqueeze(-1)
+            logits = torch.where(
+                logits < threshold,
+                torch.full_like(logits, -torch.inf),
+                logits,
+            )
+
+        if temperature > 0.0:
+            logits = logits / temperature
+            logits = logits - logits.max(dim=-1, keepdim=True).values
+            probabilities = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probabilities, num_samples=1)
+        else:
+            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+
+        if eos_id is not None and torch.all(next_token == eos_id):
+            break
+        token_ids = torch.cat((token_ids, next_token), dim=1)
+
+    return token_ids
+```
+
+```python
+PRETRAIN_CHECKPOINT = ARTIFACT_DIR / "gpt2-124m-educational-pretrain.pth"
+
+
+def load_torch_checkpoint(path, map_location):
+    try:
+        return torch.load(
+            path, map_location=map_location, weights_only=True
+        )
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def run_educational_pretraining():
+    torch.manual_seed(SEED)
+    model = GPTModel(GPT_CONFIG_124M).to(device)
+    model.eval()
+
+    with torch.no_grad():
+        initial_train_loss = calc_lm_loss_loader(
+            pretrain_train_loader,
+            model,
+            device,
+            num_batches=5,
+        )
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=0.0004, weight_decay=0.1
+    )
+    start_time = time.time()
+    train_losses, validation_losses, tokens_seen = train_lm_simple(
+        model,
+        pretrain_train_loader,
+        pretrain_val_loader,
+        optimizer,
+        device,
+        num_epochs=10,
+        eval_frequency=5,
+        eval_iterations=5,
+    )
+    elapsed_minutes = (time.time() - start_time) / 60
+
+    torch.manual_seed(SEED)
+    model.eval()
+    generated_ids = generate(
+        model,
+        text_to_token_ids("Every effort moves you", tokenizer).to(device),
+        max_new_tokens=25,
+        context_size=GPT_CONFIG_124M["context_length"],
+        temperature=1.4,
+        top_k=25,
+    )
+    generated_text = token_ids_to_text(generated_ids.cpu(), tokenizer)
+
+    torch.save(
+        {
+            "config": GPT_CONFIG_124M,
+            "model_state_dict": model.state_dict(),
+        },
+        PRETRAIN_CHECKPOINT,
+    )
+    checkpoint = load_torch_checkpoint(PRETRAIN_CHECKPOINT, "cpu")
+    reloaded_model = GPTModel(checkpoint["config"])
+    reloaded_model.load_state_dict(checkpoint["model_state_dict"])
+
+    metrics = {
+        "initial_train_loss": initial_train_loss,
+        "final_train_loss": train_losses[-1],
+        "final_validation_loss": validation_losses[-1],
+        "tokens_seen": tokens_seen[-1],
+        "minutes": elapsed_minutes,
+        "sample": generated_text,
+    }
+
+    print("Educational pretraining")
+    print(f"  Initial train loss: {initial_train_loss:.4f}")
+    print(f"  Final train loss: {train_losses[-1]:.4f}")
+    print(f"  Final validation loss: {validation_losses[-1]:.4f}")
+    print(f"  Tokens seen: {tokens_seen[-1]:,}")
+    print(f"  Training time: {elapsed_minutes:.2f} minutes")
+    print("  Generated text:")
+    print(f"    {generated_text}")
+    print(
+        f"  Checkpoint reloaded: {PRETRAIN_CHECKPOINT} "
+        f"({PRETRAIN_CHECKPOINT.stat().st_size / 1024**2:.1f} MiB)"
+    )
+    return metrics
+
+
+pretraining_metrics = run_educational_pretraining()
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+```
+
+Output:
+
+```text
+Educational pretraining
+  Initial train loss: 10.9788
+  Final train loss: 0.4936
+  Final validation loss: 6.4732
+  Tokens seen: 44,032
+  Training time: 0.25 minutes
+  Generated text:
+    Every effort moves you say terr the easel-a Stroud--I looked with equanimity. Victor Grind armas; and Mrs.
+  Checkpoint reloaded: gpt2-pipeline-run\artifacts\gpt2-124m-educational-pretrain.pth (622.6 MiB)
+```
+
+### 5. Chapter 5: checkpoints and official GPT-2 weights
+
+```python
+import tensorflow as tf
+
+tf.get_logger().setLevel("ERROR")
+try:
+    tf.config.set_visible_devices([], "GPU")
+except RuntimeError:
+    pass
+
+
+def download_file(url, destination, backup_url=None):
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() and destination.stat().st_size > 0:
+        return
+
+    for candidate_url in (url, backup_url):
+        if candidate_url is None:
+            continue
+        temporary_path = destination.with_name(destination.name + ".part")
+        try:
+            with requests.get(
+                candidate_url, stream=True, timeout=60
+            ) as response:
+                response.raise_for_status()
+                expected_size = int(
+                    response.headers.get("Content-Length", 0)
+                )
+                if destination.exists() and (
+                    expected_size == 0
+                    or destination.stat().st_size == expected_size
+                ):
+                    return
+
+                with temporary_path.open("wb") as output_file:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            output_file.write(chunk)
+
+            temporary_path.replace(destination)
+            return
+        except requests.RequestException:
+            temporary_path.unlink(missing_ok=True)
+
+    raise RuntimeError(f"Unable to download {destination.name}")
+
+
+def load_gpt2_params_from_tf_checkpoint(checkpoint_path, settings):
+    params = {"blocks": [{} for _ in range(settings["n_layer"])]}
+
+    for name, _ in tf.train.list_variables(checkpoint_path):
+        variable_array = np.squeeze(
+            tf.train.load_variable(checkpoint_path, name)
+        )
+        variable_parts = name.split("/")[1:]
+
+        target = params
+        if variable_parts[0].startswith("h"):
+            layer_number = int(variable_parts[0][1:])
+            target = params["blocks"][layer_number]
+
+        for key in variable_parts[1:-1]:
+            target = target.setdefault(key, {})
+        target[variable_parts[-1]] = variable_array
+
+    return params
+
+
+def download_and_load_gpt2(model_size, models_dir):
+    allowed_sizes = ("124M", "355M", "774M", "1558M")
+    if model_size not in allowed_sizes:
+        raise ValueError(f"model_size must be one of {allowed_sizes}")
+
+    model_directory = Path(models_dir) / model_size
+    model_directory.mkdir(parents=True, exist_ok=True)
+    primary_base = "https://openaipublic.blob.core.windows.net/gpt-2/models"
+    backup_base = "https://f001.backblazeb2.com/file/LLMs-from-scratch/gpt2"
+    filenames = (
+        "checkpoint",
+        "encoder.json",
+        "hparams.json",
+        "model.ckpt.data-00000-of-00001",
+        "model.ckpt.index",
+        "model.ckpt.meta",
+        "vocab.bpe",
+    )
+
+    for filename in filenames:
+        download_file(
+            f"{primary_base}/{model_size}/{filename}",
+            model_directory / filename,
+            f"{backup_base}/{model_size}/{filename}",
+        )
+
+    checkpoint_path = tf.train.latest_checkpoint(str(model_directory))
+    if checkpoint_path is None:
+        raise RuntimeError(f"No TensorFlow checkpoint in {model_directory}")
+
+    with (model_directory / "hparams.json").open(
+        encoding="utf-8"
+    ) as file:
+        settings = json.load(file)
+
+    params = load_gpt2_params_from_tf_checkpoint(
+        checkpoint_path, settings
+    )
+    return settings, params
+
+
+def assign(left, right):
+    right_tensor = torch.as_tensor(
+        right, dtype=left.dtype, device=left.device
+    )
+    if left.shape != right_tensor.shape:
+        raise ValueError(
+            f"Shape mismatch: left {left.shape}, right {right_tensor.shape}"
+        )
+    return nn.Parameter(
+        right_tensor.clone().detach(),
+        requires_grad=left.requires_grad,
+    )
+
+
+def load_weights_into_gpt(gpt, params):
+    gpt.pos_emb.weight = assign(gpt.pos_emb.weight, params["wpe"])
+    gpt.tok_emb.weight = assign(gpt.tok_emb.weight, params["wte"])
+
+    for block_index, block_params in enumerate(params["blocks"]):
+        query_weight, key_weight, value_weight = np.split(
+            block_params["attn"]["c_attn"]["w"], 3, axis=-1
+        )
+        query_bias, key_bias, value_bias = np.split(
+            block_params["attn"]["c_attn"]["b"], 3, axis=-1
+        )
+        block = gpt.trf_blocks[block_index]
+
+        block.att.W_query.weight = assign(
+            block.att.W_query.weight, query_weight.T
+        )
+        block.att.W_key.weight = assign(
+            block.att.W_key.weight, key_weight.T
+        )
+        block.att.W_value.weight = assign(
+            block.att.W_value.weight, value_weight.T
+        )
+        block.att.W_query.bias = assign(
+            block.att.W_query.bias, query_bias
+        )
+        block.att.W_key.bias = assign(block.att.W_key.bias, key_bias)
+        block.att.W_value.bias = assign(
+            block.att.W_value.bias, value_bias
+        )
+        block.att.out_proj.weight = assign(
+            block.att.out_proj.weight,
+            block_params["attn"]["c_proj"]["w"].T,
+        )
+        block.att.out_proj.bias = assign(
+            block.att.out_proj.bias,
+            block_params["attn"]["c_proj"]["b"],
+        )
+        block.ff.layers[0].weight = assign(
+            block.ff.layers[0].weight,
+            block_params["mlp"]["c_fc"]["w"].T,
+        )
+        block.ff.layers[0].bias = assign(
+            block.ff.layers[0].bias,
+            block_params["mlp"]["c_fc"]["b"],
+        )
+        block.ff.layers[2].weight = assign(
+            block.ff.layers[2].weight,
+            block_params["mlp"]["c_proj"]["w"].T,
+        )
+        block.ff.layers[2].bias = assign(
+            block.ff.layers[2].bias,
+            block_params["mlp"]["c_proj"]["b"],
+        )
+        block.norm1.scale = assign(
+            block.norm1.scale, block_params["ln_1"]["g"]
+        )
+        block.norm1.shift = assign(
+            block.norm1.shift, block_params["ln_1"]["b"]
+        )
+        block.norm2.scale = assign(
+            block.norm2.scale, block_params["ln_2"]["g"]
+        )
+        block.norm2.shift = assign(
+            block.norm2.shift, block_params["ln_2"]["b"]
+        )
+
+    gpt.final_norm.scale = assign(gpt.final_norm.scale, params["g"])
+    gpt.final_norm.shift = assign(gpt.final_norm.shift, params["b"])
+    gpt.out_head.weight = assign(gpt.out_head.weight, params["wte"])
+
+
+MODEL_CONFIGS = {
+    "gpt2-small (124M)": {
+        "emb_dim": 768,
+        "n_layers": 12,
+        "n_heads": 12,
+    },
+    "gpt2-medium (355M)": {
+        "emb_dim": 1024,
+        "n_layers": 24,
+        "n_heads": 16,
+    },
+    "gpt2-large (774M)": {
+        "emb_dim": 1280,
+        "n_layers": 36,
+        "n_heads": 20,
+    },
+    "gpt2-xl (1558M)": {
+        "emb_dim": 1600,
+        "n_layers": 48,
+        "n_heads": 25,
+    },
+}
+
+
+def load_official_gpt2(model_name):
+    if model_name not in MODEL_CONFIGS:
+        raise ValueError(f"Unknown model: {model_name}")
+
+    config = {
+        "vocab_size": 50257,
+        "context_length": 1024,
+        "drop_rate": 0.0,
+        "qkv_bias": True,
+        **MODEL_CONFIGS[model_name],
+    }
+    model_size = model_name.split(" ")[-1].strip("()")
+    settings, params = download_and_load_gpt2(model_size, MODEL_DIR)
+    model = GPTModel(config)
+    load_weights_into_gpt(model, params)
+    return model, config, settings
+```
+
+### 6. Chapter 6: GPT-2 124M classification branch
+
+```python
+SMS_URL = "https://archive.ics.uci.edu/static/public/228/sms+spam+collection.zip"
+SMS_ZIP_PATH = DATA_DIR / "sms-spam-collection.zip"
+SMS_DIRECTORY = DATA_DIR / "sms-spam-collection"
+SMS_DATA_PATH = SMS_DIRECTORY / "SMSSpamCollection.tsv"
+
+
+def download_and_extract_sms_data():
+    if SMS_DATA_PATH.exists():
+        return
+
+    download_url(SMS_URL, SMS_ZIP_PATH)
+
+    SMS_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(SMS_ZIP_PATH) as archive:
+        archive.extractall(SMS_DIRECTORY)
+
+    extracted_data_path = SMS_DIRECTORY / "SMSSpamCollection"
+    if not extracted_data_path.exists():
+        raise FileNotFoundError("SMSSpamCollection missing from archive")
+    extracted_data_path.replace(SMS_DATA_PATH)
+
+
+def create_balanced_dataset(dataframe):
+    spam_count = (dataframe["Label"] == "spam").sum()
+    ham_subset = dataframe[dataframe["Label"] == "ham"].sample(
+        spam_count, random_state=SEED
+    )
+    return pd.concat(
+        [ham_subset, dataframe[dataframe["Label"] == "spam"]]
+    ).copy()
+
+
+def random_split(dataframe, train_fraction, validation_fraction):
+    shuffled = dataframe.sample(frac=1, random_state=SEED).reset_index(
+        drop=True
+    )
+    train_end = int(len(shuffled) * train_fraction)
+    validation_end = train_end + int(
+        len(shuffled) * validation_fraction
+    )
+    return (
+        shuffled.iloc[:train_end].copy(),
+        shuffled.iloc[train_end:validation_end].copy(),
+        shuffled.iloc[validation_end:].copy(),
+    )
+
+
+download_and_extract_sms_data()
+sms_dataframe = pd.read_csv(
+    SMS_DATA_PATH,
+    sep="	",
+    header=None,
+    names=["Label", "Text"],
+)
+balanced_sms = create_balanced_dataset(sms_dataframe)
+balanced_sms["Label"] = balanced_sms["Label"].map(
+    {"ham": 0, "spam": 1}
+)
+sms_train, sms_validation, sms_test = random_split(
+    balanced_sms, train_fraction=0.7, validation_fraction=0.1
+)
+
+SMS_TRAIN_PATH = DATA_DIR / "sms-train.csv"
+SMS_VALIDATION_PATH = DATA_DIR / "sms-validation.csv"
+SMS_TEST_PATH = DATA_DIR / "sms-test.csv"
+sms_train.to_csv(SMS_TRAIN_PATH, index=False)
+sms_validation.to_csv(SMS_VALIDATION_PATH, index=False)
+sms_test.to_csv(SMS_TEST_PATH, index=False)
+
+
+class SpamDataset(Dataset):
+    def __init__(
+        self,
+        csv_file,
+        tokenizer,
+        max_length=None,
+        pad_token_id=50256,
+    ):
+        self.data = pd.read_csv(csv_file)
+        self.encoded_texts = [
+            tokenizer.encode(text) for text in self.data["Text"]
+        ]
+        self.max_length = (
+            max(len(encoded) for encoded in self.encoded_texts)
+            if max_length is None
+            else max_length
+        )
+        self.encoded_texts = [
+            encoded[: self.max_length]
+            + [pad_token_id]
+            * (self.max_length - len(encoded[: self.max_length]))
+            for encoded in self.encoded_texts
+        ]
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        return (
+            torch.tensor(self.encoded_texts[index], dtype=torch.long),
+            torch.tensor(
+                self.data.iloc[index]["Label"], dtype=torch.long
+            ),
+        )
+
+
+spam_train_dataset = SpamDataset(SMS_TRAIN_PATH, tokenizer)
+spam_validation_dataset = SpamDataset(
+    SMS_VALIDATION_PATH,
+    tokenizer,
+    max_length=spam_train_dataset.max_length,
+)
+spam_test_dataset = SpamDataset(
+    SMS_TEST_PATH,
+    tokenizer,
+    max_length=spam_train_dataset.max_length,
+)
+
+torch.manual_seed(SEED)
+spam_train_loader = DataLoader(
+    spam_train_dataset,
+    batch_size=8,
+    shuffle=True,
+    drop_last=True,
+    num_workers=0,
+)
+spam_validation_loader = DataLoader(
+    spam_validation_dataset,
+    batch_size=8,
+    shuffle=False,
+    drop_last=False,
+    num_workers=0,
+)
+spam_test_loader = DataLoader(
+    spam_test_dataset,
+    batch_size=8,
+    shuffle=False,
+    drop_last=False,
+    num_workers=0,
+)
+
+print(
+    f"SMS splits: {len(spam_train_dataset):,} train / "
+    f"{len(spam_validation_dataset):,} validation / "
+    f"{len(spam_test_dataset):,} test"
+)
+print(f"Maximum sequence length: {spam_train_dataset.max_length} tokens")
+```
+
+Output:
+
+```text
+SMS splits: 1,045 train / 149 validation / 300 test
+Maximum sequence length: 120 tokens
+```
+
+```python
+def calc_classifier_accuracy(
+    data_loader, model, device, num_batches=None
+):
+    model.eval()
+    num_batches = (
+        len(data_loader)
+        if num_batches is None
+        else min(num_batches, len(data_loader))
+    )
+    correct_predictions, example_count = 0, 0
+
+    for batch_index, (input_batch, target_batch) in enumerate(data_loader):
+        if batch_index >= num_batches:
+            break
+        input_batch = input_batch.to(device)
+        target_batch = target_batch.to(device)
+        with torch.no_grad():
+            logits = model(input_batch)[:, -1, :]
+        predictions = torch.argmax(logits, dim=-1)
+        example_count += predictions.shape[0]
+        correct_predictions += (predictions == target_batch).sum().item()
+
+    return correct_predictions / example_count
+
+
+def calc_classifier_loss_batch(
+    input_batch, target_batch, model, device
+):
+    input_batch = input_batch.to(device)
+    target_batch = target_batch.to(device)
+    logits = model(input_batch)[:, -1, :]
+    return torch.nn.functional.cross_entropy(logits, target_batch)
+
+
+def calc_classifier_loss_loader(
+    data_loader, model, device, num_batches=None
+):
+    if len(data_loader) == 0:
+        return float("nan")
+    num_batches = (
+        len(data_loader)
+        if num_batches is None
+        else min(num_batches, len(data_loader))
+    )
+    total_loss = 0.0
+    for batch_index, (input_batch, target_batch) in enumerate(data_loader):
+        if batch_index >= num_batches:
+            break
+        total_loss += calc_classifier_loss_batch(
+            input_batch, target_batch, model, device
+        ).item()
+    return total_loss / num_batches
+
+
+def evaluate_classifier(
+    model, train_loader, validation_loader, device, eval_iterations
+):
+    model.eval()
+    with torch.no_grad():
+        train_loss = calc_classifier_loss_loader(
+            train_loader,
+            model,
+            device,
+            num_batches=eval_iterations,
+        )
+        validation_loss = calc_classifier_loss_loader(
+            validation_loader,
+            model,
+            device,
+            num_batches=eval_iterations,
+        )
+    model.train()
+    return train_loss, validation_loss
+
+
+def train_classifier_simple(
+    model,
+    train_loader,
+    validation_loader,
+    optimizer,
+    device,
+    num_epochs,
+    eval_frequency,
+    eval_iterations,
+):
+    train_losses, validation_losses = [], []
+    train_accuracies, validation_accuracies = [], []
+    examples_seen, global_step = 0, -1
+
+    for _ in range(num_epochs):
+        model.train()
+        for input_batch, target_batch in train_loader:
+            optimizer.zero_grad()
+            loss = calc_classifier_loss_batch(
+                input_batch, target_batch, model, device
+            )
+            loss.backward()
+            optimizer.step()
+            examples_seen += input_batch.shape[0]
+            global_step += 1
+
+            if global_step % eval_frequency == 0:
+                train_loss, validation_loss = evaluate_classifier(
+                    model,
+                    train_loader,
+                    validation_loader,
+                    device,
+                    eval_iterations,
+                )
+                train_losses.append(train_loss)
+                validation_losses.append(validation_loss)
+
+        train_accuracies.append(
+            calc_classifier_accuracy(
+                train_loader,
+                model,
+                device,
+                num_batches=eval_iterations,
+            )
+        )
+        validation_accuracies.append(
+            calc_classifier_accuracy(
+                validation_loader,
+                model,
+                device,
+                num_batches=eval_iterations,
+            )
+        )
+
+    return {
+        "train_losses": train_losses,
+        "validation_losses": validation_losses,
+        "train_accuracies": train_accuracies,
+        "validation_accuracies": validation_accuracies,
+        "examples_seen": examples_seen,
+    }
+
+
+def classify_text(
+    text,
+    model,
+    tokenizer,
+    device,
+    max_length,
+    pad_token_id=50256,
+):
+    model.eval()
+    supported_length = model.pos_emb.weight.shape[0]
+    effective_length = min(max_length, supported_length)
+    input_ids = tokenizer.encode(text)[:effective_length]
+    input_ids += [pad_token_id] * (effective_length - len(input_ids))
+    input_tensor = torch.tensor(input_ids, device=device).unsqueeze(0)
+    with torch.no_grad():
+        logits = model(input_tensor)[:, -1, :]
+    label = torch.argmax(logits, dim=-1).item()
+    return "spam" if label == 1 else "not spam"
+```
+
+```python
+CLASSIFIER_MODEL_NAME = "gpt2-small (124M)"
+CLASSIFIER_CHECKPOINT = ARTIFACT_DIR / "gpt2-124m-sms-classifier.pth"
+
+
+def run_classification_branch():
+    model, config, _ = load_official_gpt2(CLASSIFIER_MODEL_NAME)
+
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+
+    torch.manual_seed(SEED)
+    model.out_head = nn.Linear(config["emb_dim"], 2)
+    for parameter in model.trf_blocks[-1].parameters():
+        parameter.requires_grad = True
+    for parameter in model.final_norm.parameters():
+        parameter.requires_grad = True
+
+    model.to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=5e-5, weight_decay=0.1
+    )
+    start_time = time.time()
+    train_classifier_simple(
+        model,
+        spam_train_loader,
+        spam_validation_loader,
+        optimizer,
+        device,
+        num_epochs=5,
+        eval_frequency=50,
+        eval_iterations=5,
+    )
+    elapsed_minutes = (time.time() - start_time) / 60
+
+    metrics = {
+        "train_accuracy": calc_classifier_accuracy(
+            spam_train_loader, model, device
+        ),
+        "validation_accuracy": calc_classifier_accuracy(
+            spam_validation_loader, model, device
+        ),
+        "test_accuracy": calc_classifier_accuracy(
+            spam_test_loader, model, device
+        ),
+        "minutes": elapsed_minutes,
+    }
+
+    examples = [
+        "You are a winner selected to receive a $1000 cash award.",
+        "Are we still on for dinner tonight? Let me know!",
+    ]
+    predictions = [
+        (text, classify_text(
+            text,
+            model,
+            tokenizer,
+            device,
+            spam_train_dataset.max_length,
+        ))
+        for text in examples
+    ]
+
+    torch.save(model.state_dict(), CLASSIFIER_CHECKPOINT)
+
+    print("SMS classification")
+    print(f"  Train accuracy: {metrics['train_accuracy']:.2%}")
+    print(f"  Validation accuracy: {metrics['validation_accuracy']:.2%}")
+    print(f"  Test accuracy: {metrics['test_accuracy']:.2%}")
+    print(f"  Training time: {elapsed_minutes:.2f} minutes")
+    for index, (text, prediction) in enumerate(predictions, start=1):
+        print(f"  Prediction {index}: {prediction}")
+        print(f"    {text}")
+    print(f"  Checkpoint: {CLASSIFIER_CHECKPOINT}")
+    return metrics, predictions
+
+
+classification_metrics, classification_predictions = (
+    run_classification_branch()
+)
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+```
+
+Output:
+
+```text
+SMS classification
+  Train accuracy: 94.42%
+  Validation accuracy: 95.30%
+  Test accuracy: 93.00%
+  Training time: 0.53 minutes
+  Prediction 1: spam
+    You are a winner selected to receive a $1000 cash award.
+  Prediction 2: not spam
+    Are we still on for dinner tonight? Let me know!
+  Checkpoint: gpt2-pipeline-run\artifacts\gpt2-124m-sms-classifier.pth
+```
+
+### 7. Chapter 7: GPT-2 355M instruction-tuning branch
+
+```python
+INSTRUCTION_DATA_URL = (
+    "https://raw.githubusercontent.com/rasbt/LLMs-from-scratch/"
+    "main/ch07/01_main-chapter-code/instruction-data.json"
+)
+INSTRUCTION_DATA_PATH = DATA_DIR / "instruction-data.json"
+
+download_url(INSTRUCTION_DATA_URL, INSTRUCTION_DATA_PATH)
+
+with INSTRUCTION_DATA_PATH.open(encoding="utf-8") as file:
+    instruction_data = json.load(file)
+
+
+def format_input(entry):
+    instruction_text = (
+        "Below is an instruction that describes a task. "
+        "Write a response that appropriately completes the request."
+        f"\n\n### Instruction:\n{entry['instruction']}"
+    )
+    input_text = (
+        f"\n\n### Input:\n{entry['input']}" if entry["input"] else ""
+    )
+    return instruction_text + input_text
+
+
+instruction_train_end = int(len(instruction_data) * 0.85)
+instruction_test_size = int(len(instruction_data) * 0.1)
+instruction_test_end = instruction_train_end + instruction_test_size
+
+instruction_train_data = instruction_data[:instruction_train_end]
+instruction_test_data = instruction_data[
+    instruction_train_end:instruction_test_end
+]
+instruction_validation_data = instruction_data[instruction_test_end:]
+
+
+class InstructionDataset(Dataset):
+    def __init__(self, data, tokenizer):
+        self.data = data
+        self.encoded_texts = []
+        for entry in data:
+            response = f"\n\n### Response:\n{entry['output']}"
+            self.encoded_texts.append(
+                tokenizer.encode(format_input(entry) + response)
+            )
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        return self.encoded_texts[index]
+
+
+def custom_collate_fn(
+    batch,
+    pad_token_id=50256,
+    ignore_index=-100,
+    allowed_max_length=None,
+    device="cpu",
+):
+    batch_max_length = max(len(item) + 1 for item in batch)
+    input_list, target_list = [], []
+
+    for item in batch:
+        padded = item.copy() + [pad_token_id]
+        padded += [pad_token_id] * (batch_max_length - len(padded))
+        inputs = torch.tensor(padded[:-1])
+        targets = torch.tensor(padded[1:])
+
+        padding_indices = torch.nonzero(
+            targets == pad_token_id
+        ).flatten()
+        if padding_indices.numel() > 1:
+            targets[padding_indices[1:]] = ignore_index
+
+        if allowed_max_length is not None:
+            inputs = inputs[:allowed_max_length]
+            targets = targets[:allowed_max_length]
+
+        input_list.append(inputs)
+        target_list.append(targets)
+
+    return (
+        torch.stack(input_list).to(device),
+        torch.stack(target_list).to(device),
+    )
+
+
+instruction_train_dataset = InstructionDataset(
+    instruction_train_data, tokenizer
+)
+instruction_validation_dataset = InstructionDataset(
+    instruction_validation_data, tokenizer
+)
+instruction_test_dataset = InstructionDataset(
+    instruction_test_data, tokenizer
+)
+
+
+def make_instruction_loaders(batch_size):
+    collate = partial(
+        custom_collate_fn,
+        device=device,
+        allowed_max_length=1024,
+    )
+    torch.manual_seed(SEED)
+    train_loader = DataLoader(
+        instruction_train_dataset,
+        batch_size=batch_size,
+        collate_fn=collate,
+        shuffle=True,
+        drop_last=True,
+        num_workers=0,
+    )
+    validation_loader = DataLoader(
+        instruction_validation_dataset,
+        batch_size=batch_size,
+        collate_fn=collate,
+        shuffle=False,
+        drop_last=False,
+        num_workers=0,
+    )
+    test_loader = DataLoader(
+        instruction_test_dataset,
+        batch_size=batch_size,
+        collate_fn=collate,
+        shuffle=False,
+        drop_last=False,
+        num_workers=0,
+    )
+    return train_loader, validation_loader, test_loader
+
+
+print(
+    f"Instruction splits: {len(instruction_train_dataset):,} train / "
+    f"{len(instruction_validation_dataset):,} validation / "
+    f"{len(instruction_test_dataset):,} test"
+)
+```
+
+Output:
+
+```text
+Instruction splits: 935 train / 55 validation / 110 test
+```
+
+```python
+INSTRUCTION_MODEL_NAME = "gpt2-medium (355M)"
+INSTRUCTION_RESPONSES_PATH = (
+    ARTIFACT_DIR / "instruction-data-with-response.json"
+)
+INSTRUCTION_CHECKPOINT = ARTIFACT_DIR / "gpt2-355m-sft.pth"
+
+
+def is_cuda_out_of_memory(error):
+    return (
+        device.type == "cuda"
+        and "out of memory" in str(error).lower()
+    )
+
+
+def response_from_generation(generated_text, input_text):
+    return (
+        generated_text[len(input_text) :]
+        .replace("### Response:", "")
+        .strip()
+    )
+
+
+def run_instruction_attempt(batch_size):
+    train_loader, validation_loader, _ = make_instruction_loaders(
+        batch_size
+    )
+    model, config, _ = load_official_gpt2(INSTRUCTION_MODEL_NAME)
+    model.to(device)
+
+    torch.manual_seed(SEED)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=0.00005,
+        weight_decay=0.1,
+        foreach=False,
+    )
+    start_time = time.time()
+    train_losses, validation_losses, tokens_seen = train_lm_simple(
+        model,
+        train_loader,
+        validation_loader,
+        optimizer,
+        device,
+        num_epochs=2,
+        eval_frequency=5,
+        eval_iterations=5,
+    )
+    elapsed_minutes = (time.time() - start_time) / 60
+
+    if not train_losses or not validation_losses:
+        raise RuntimeError("Instruction metrics were not recorded")
+    if not np.isfinite(train_losses[-1]):
+        raise RuntimeError("Instruction train loss is not finite")
+    if not np.isfinite(validation_losses[-1]):
+        raise RuntimeError("Instruction validation loss is not finite")
+
+    model.eval()
+    completed_test_data = []
+    for original_entry in instruction_test_data:
+        entry = dict(original_entry)
+        input_text = format_input(entry)
+        generated_ids = generate(
+            model,
+            text_to_token_ids(input_text, tokenizer).to(device),
+            max_new_tokens=256,
+            context_size=config["context_length"],
+            eos_id=50256,
+        )
+        generated_text = token_ids_to_text(
+            generated_ids.cpu(), tokenizer
+        )
+        entry["model_response"] = response_from_generation(
+            generated_text, input_text
+        )
+        completed_test_data.append(entry)
+
+    representative_responses = [
+        {
+            "instruction": entry["instruction"],
+            "expected": entry["output"],
+            "model_response": entry["model_response"],
+        }
+        for entry in completed_test_data[:3]
+    ]
+
+    with INSTRUCTION_RESPONSES_PATH.open(
+        "w", encoding="utf-8"
+    ) as file:
+        json.dump(
+            completed_test_data,
+            file,
+            indent=2,
+            ensure_ascii=False,
+        )
+    torch.save(model.state_dict(), INSTRUCTION_CHECKPOINT)
+
+    metrics = {
+        "batch_size": batch_size,
+        "final_train_loss": train_losses[-1],
+        "final_validation_loss": validation_losses[-1],
+        "tokens_seen": tokens_seen[-1],
+        "minutes": elapsed_minutes,
+    }
+    return metrics, representative_responses, completed_test_data
+
+
+def run_instruction_finetuning(batch_sizes=(8, 4, 2)):
+    for batch_size in batch_sizes:
+        try:
+            result = run_instruction_attempt(batch_size)
+        except RuntimeError as error:
+            if not is_cuda_out_of_memory(error):
+                raise
+            if batch_size == batch_sizes[-1]:
+                raise
+            print(
+                f"CUDA OOM at batch size {batch_size}; retrying "
+                "with a fresh checkpoint."
+            )
+        else:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return result
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    raise RuntimeError("No instruction batch size completed")
+
+
+(
+    instruction_metrics,
+    representative_responses,
+    instruction_test_data_with_responses,
+) = run_instruction_finetuning()
+
+print("Instruction tuning")
+print(f"  Batch size: {instruction_metrics['batch_size']}")
+print(f"  Final train loss: {instruction_metrics['final_train_loss']:.4f}")
+print(
+    "  Final validation loss: "
+    f"{instruction_metrics['final_validation_loss']:.4f}"
+)
+print(f"  Tokens seen: {instruction_metrics['tokens_seen']:,}")
+print(f"  Training time: {instruction_metrics['minutes']:.2f} minutes")
+
+for index, response in enumerate(representative_responses, start=1):
+    print(f"\nResponse {index}")
+    print(f"  Instruction: {response['instruction']}")
+    print(f"  Expected: {response['expected']}")
+    print(f"  Model: {response['model_response']}")
+
+print(f"\nResponses: {INSTRUCTION_RESPONSES_PATH}")
+print(f"Checkpoint: {INSTRUCTION_CHECKPOINT}")
+```
+
+Output:
+
+```text
+Instruction tuning
+  Batch size: 8
+  Final train loss: 0.2946
+  Final validation loss: 0.6534
+  Tokens seen: 128,776
+  Training time: 3.32 minutes
+
+Response 1
+  Instruction: Rewrite the sentence using a simile.
+  Expected: The car is as fast as lightning.
+  Model: The car is as fast as a bullet.
+
+Response 2
+  Instruction: What type of cloud is typically associated with thunderstorms?
+  Expected: The type of cloud typically associated with thunderstorms is cumulonimbus.
+  Model: The type of cloud associated with thunderstorms is a cumulus cloud.
+
+Response 3
+  Instruction: Name the author of 'Pride and Prejudice'.
+  Expected: Jane Austen.
+  Model: The author of 'Pride and Prejudice' is Jane Austen.
+
+Responses: gpt2-pipeline-run\artifacts\instruction-data-with-response.json
+Checkpoint: gpt2-pipeline-run\artifacts\gpt2-355m-sft.pth
+```
+
+### 8. Optional Ollama judge
+
+```python
+RUN_OLLAMA_JUDGE = os.environ.get("RUN_OLLAMA_JUDGE", "0") == "1"
+OLLAMA_JUDGE_MODEL = os.environ.get("OLLAMA_JUDGE_MODEL", "llama3")
+OLLAMA_URL = os.environ.get(
+    "OLLAMA_URL", "http://localhost:11434/api/chat"
+)
+
+
+def query_ollama(prompt, model=OLLAMA_JUDGE_MODEL, url=OLLAMA_URL):
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "options": {
+                "seed": SEED,
+                "temperature": 0,
+                "num_ctx": 2048,
+            },
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    response_text = ""
+    with urllib.request.urlopen(request, timeout=120) as response:
+        for line in response:
+            chunk = json.loads(line.decode("utf-8"))
+            response_text += chunk["message"]["content"]
+    return response_text
+
+
+def generate_model_scores(entries, response_key, model=OLLAMA_JUDGE_MODEL):
+    scores = []
+    for entry in entries:
+        prompt = (
+            f"Given the input '{format_input(entry)}' and correct output "
+            f"'{entry['output']}', score the model response "
+            f"'{entry[response_key]}' from 0 to 100. "
+            "Respond with the integer only."
+        )
+        result = query_ollama(prompt, model=model)
+        match = re.search(r"\b(?:100|[1-9]?\d)\b", result)
+        if match:
+            scores.append(int(match.group()))
+    return scores
+
+
+if not RUN_OLLAMA_JUDGE:
+    ollama_status = {
+        "status": "skipped",
+        "reason": "RUN_OLLAMA_JUDGE is not enabled",
+    }
+else:
+    try:
+        ollama_scores = generate_model_scores(
+            instruction_test_data_with_responses, "model_response"
+        )
+        if not ollama_scores:
+            ollama_status = {
+                "status": "skipped",
+                "reason": "Ollama returned no integer scores",
+            }
+        else:
+            ollama_status = {
+                "status": "completed",
+                "model": OLLAMA_JUDGE_MODEL,
+                "scored": len(ollama_scores),
+                "total": len(instruction_test_data_with_responses),
+                "average": sum(ollama_scores) / len(ollama_scores),
+            }
+    except (
+        OSError,
+        TimeoutError,
+        urllib.error.URLError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+    ) as error:
+        ollama_status = {
+            "status": "skipped",
+            "reason": f"Ollama unavailable: {error}",
+        }
+
+if ollama_status["status"] == "completed":
+    print(
+        f"Ollama judge: {ollama_status['average']:.1f}/100 "
+        f"({ollama_status['scored']} responses, "
+        f"{ollama_status['model']})"
+    )
+else:
+    print(f"Ollama judge: SKIPPED - {ollama_status['reason']}")
+```
+
+Output:
+
+```text
+Ollama judge: SKIPPED - RUN_OLLAMA_JUDGE is not enabled
+```
+
+### 9. Artifact and metric summary
+
+```python
+expected_artifacts = (
+    PRETRAIN_CHECKPOINT,
+    CLASSIFIER_CHECKPOINT,
+    INSTRUCTION_CHECKPOINT,
+    INSTRUCTION_RESPONSES_PATH,
+)
+
+print("Artifacts")
+for artifact_path in expected_artifacts:
+    if artifact_path.exists():
+        size = artifact_path.stat().st_size / 1024**2
+        print(f"  Ready: {artifact_path} ({size:.1f} MiB)")
+    else:
+        print(f"  Missing: {artifact_path}")
+```
+
+## Runtime artifacts
+
+A complete run creates these temporary files under `gpt2-pipeline-run/artifacts/`:
+
+- `gpt2-124m-educational-pretrain.pth`
+- `gpt2-124m-sms-classifier.pth`
+- `gpt2-355m-sft.pth`
+- `instruction-data-with-response.json`
+
+The weights, datasets, and run directory are not published with the site. The notebook retains only the compact outputs needed to verify the pipeline.
+
+## Sources and license
+
+This pipeline selects and reorders code from Chapters 2–7 of Sebastian Raschka's [_Build a Large Language Model (From Scratch)_](https://www.manning.com/books/build-a-large-language-model-from-scratch) and its [official code repository](https://github.com/rasbt/LLMs-from-scratch). The original code is distributed under the [Apache License 2.0](https://github.com/rasbt/LLMs-from-scratch/blob/main/LICENSE.txt). This transcript adds only ordering, necessary wiring corrections, and execution safeguards; it does not replace the book or its full explanations.
