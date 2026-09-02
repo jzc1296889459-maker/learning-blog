@@ -1,0 +1,28 @@
+---
+title: 'my study progress'
+description: '对学习过程中随想的一些记录'
+publishDate: 2026-09-02
+tags:
+  - 随想
+  - 总结
+  - LLM
+language: 'zh-CN'
+draft: false
+comment: false
+---
+
+## 2026/09/02 小结
+
+LLM training并不是我决定的要钻研的方向，但是对其整体的认识是基本所有LLM应用的基础。经过一段时间对LLM training的整个基本流程的认识，我目前计划work through以下几本书：
+
+- [ ] [Build a Large Language Model (From Scratch)](https://github.com/rasbt/LLMs-from-scratch) (by Sebastian Raschka)
+- [ ] [Build a Reasoning Model (From Scratch)](https://github.com/rasbt/reasoning-from-scratch) (by Sebastian Raschka)
+- [ ] [Reinforcement Learning from Human Feedback](https://rlhfbook.com/) (by Nathan Lambert)
+- [ ] [Hands-On LLM Serving and Optimization](https://www.oreilly.com/library/view/hands-on-llm-serving/9798341621480/) (by Chi Wang & Peiheng Hu)
+- [ ] [Stanford CS336 assignments](https://cs336.stanford.edu/) (optional)
+
+Raschka的两本书都有完整的code例子，通过复现GPT-2 (第一本) 和Qwen3 (第二本)来讲解了从基本的base model到reasoning model的所有重要的组成部分。Raschka的github上，以及他的[个人网站](https://sebastianraschka.com/blog/)上还有非常多的对前沿各种架构和inference techniques的from scratch式的复现。Lambert是post-training方面的前沿学者之一（参见他的[个人与Interconnects简介](https://www.interconnects.ai/about)）。他的[RLHF Book](https://rlhfbook.com/)涵盖了他对现在post-training最重要的一些recipes的理解和相关experiements的推荐。Lambert个人经营的[Interconnects](https://www.interconnects.ai/)上经常分享他对前沿Lab，LLM学术界和业界的生态，中美模型竞赛的博弈之类的看法，其中很多观点我也非常认同。前面这三部曲就包含了整个LLM训练的流程。为了补上从能够access一个LLM，到能够部署、运行一个LLM，包括性能、成本和规模化方面这些更工程的知识，我加上了[Wang与Hu的这本书](https://www.oreilly.com/library/view/hands-on-llm-serving/9798341621480/)。Stanford [CS336课程及其作业](https://cs336.stanford.edu/)可以作为巩固基础的额外练习。
+
+可以看到，我的选择都是“hands-on”这一类拥有完整代码的书。这因为我还远没有达到，看到一个idea就能写出相应的代码，也没有通过AI获得code以后就知道怎么检验的水平。实际上，我甚至认为在初学这个阶段，照着书上的code，一行一行自己打一遍，并确认能够运行是非常必要的。效率是一方面，培养直觉是另一方面，arguably更重要的一方面。作为一个数学出身的人来说，我对一个东西为什么正确可以说有一种执着。这也是我为什么认为Raschka的书和他的Blogs是非常重要的resources。但是这并不是说我就不会培养AI coding主导的以理解架构，“读”代码为主的能力。实际上，我认为这只是阶段问题。当一个人有足够的直觉以后，他通过读一段代码，就能大概判断它的正确性，并且到那个阶段，如果需要，他基本也会具备确认这段代码正确性的能力。在那个阶段，一行一行的去理解代码的收益，就远不如去看这段代码的作用和其所处的架构这种更高层级的理解。这和Terry Tao所说的数学教育的[pre-rigorous、rigorous和post-rigorous三个阶段](https://terrytao.wordpress.com/career-advice/theres-more-to-mathematics-than-rigour-and-proofs/)是异曲同工的。这也是我为什么认为，不管什么学科，即使有了AI辅助，某种程度至下而上的基础训练还是有必要的。不同的只是AI把进入下一个阶段的门槛降低了而已，因为在更高层级的学习方式（譬如注重于概念之间的联系，通过类似metaphor形式去建立直觉，当有了这些高级的直觉，再至上而下的用自己的方式，或者用AI去重新构建细节）现在效率和收益都更高了。
+
+这是目前我对LLM training的想法。更多的时间和精力会放在RL和control，以及diffusion models上，至于为什么将它们作为我研究的方向，会在之后补充。
