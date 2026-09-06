@@ -2,7 +2,7 @@
 title: 'LLM from Scratch Chapter 2 Study Notes'
 description: 'A line-by-line study of GPT-2 tokenization, sliding windows, PyTorch data loading, and embeddings.'
 date: 2026-08-18
-updatedDate: 2026-08-18
+updatedDate: 2026-09-06
 tags:
   - llm
   - pytorch
@@ -60,13 +60,18 @@ Line by line:
 
 ## 2. Creating the GPT-2 tokenizer
 
+Tokenization, as the name suggests, means “splitting” input text into individual words or
+components. These individual parts are called tokens. The simplest tokenization can be done with
+`.split()`. Most tokenizers have their own rules for handling
+punctuation, prefixes, suffixes, word stems, and so on. Technically, this can be seen as a series of
+exercises in string operations and Python’s `re` module. The book also includes a more basic example
+of building a tokenizer from scratch. However, many open-source tokenizers for LLM training are
+already available, and AI coding tools can probably one-shot a capable tokenizer as well. Here,
+following the book, we use the tokenizer from the `tiktoken` library—the same kind of tokenizer used
+in actual GPT training.
+
 ```python
 import tiktoken
-```
-
-`tiktoken` is OpenAI’s open-source, fast tokenization library.
-
-```python
 print(tiktoken.__version__)
 tokenizer = tiktoken.get_encoding("gpt2")
 ```
@@ -74,6 +79,11 @@ tokenizer = tiktoken.get_encoding("gpt2")
 - `get_encoding("gpt2")` loads the encoding rules and vocabulary used by GPT-2. The book introduces Byte Pair Encoding (BPE), which I plan to study further in a separate article.
 
 ## 3. Encoding text as token IDs
+
+Another role of a tokenizer is to assign each token an integer ID according to a vocabulary; this
+is what we call encoding. Formally, it maps tokens—a list of strings—to a list of integers, which
+can also be viewed as a vector. One detail worth noting is that when we use the `tiktoken`
+tokenizer, its `.encode()` method performs tokenization and encoding together.
 
 ```python
 with open("the-verdict.txt", "r", encoding="utf-8") as f:
@@ -205,7 +215,10 @@ input_seq:  [2, 5, 420, 8]
 target_seq: [5, 420, 8, 9]
 ```
 
-`stride` determines where the next window starts, not how the current `target_seq` is shifted. With `stride=2`, the next sample is:
+Although the code is quite straightforward, I previously misunderstood one detail: `stride`
+determines where the next window starts, not how the current `target_seq` is shifted.
+**`target_seq` is always `input_seq` shifted forward by one position (not by `stride` positions).**
+With `stride=2`, the next sample is:
 
 ```text
 input_seq:  [420, 8, 9, 13]
@@ -439,8 +452,6 @@ Final input embeddings [batch_size, seq_len, embed_dim]
 ▼
 Later Transformer blocks
 ```
-
-The diagram separates token splitting from token-ID mapping to make the concepts clearer. In the code, the `tiktoken` library performs both steps through `tokenizer.encode(raw_text)`. The training targets are produced from a copy of the same token IDs shifted one position to the right.
 
 The next step is to pass these input vectors into an attention mechanism so the model can learn relationships between different positions in a sequence.
 

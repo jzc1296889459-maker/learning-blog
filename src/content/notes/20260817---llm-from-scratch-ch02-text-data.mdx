@@ -2,7 +2,7 @@
 title: '从文本到输入向量：LLM from Scratch 第 2 章学习笔记'
 description: '逐行理解 GPT-2 分词、滑动窗口、PyTorch DataLoader、词元嵌入与位置嵌入。'
 date: 2026-08-18
-updatedDate: 2026-08-18
+updatedDate: 2026-09-06
 tags:
   - llm
   - pytorch
@@ -59,13 +59,10 @@ if not os.path.exists("the-verdict.txt"):
 
 ## 2. 创建 GPT-2 分词器
 
+分词，顾名思义，就是将输入的文本“切分”成一个一个独立的词或者组成部分。这些独立的部分被称为tokens。最简单的分词可以直接使用`.split()`。大多数分词器都有自己的分词规则，对标点的处理，对词首词尾词干等的处理。技术上来说，可以看作就是对strings的operations和利用Python里的`re` module的一系列练习。书上也有包含更基础的手搓一个tokenizer的example。不过现在已有很多开源的LLM训练用的分词器，用AI coding工具应该也能轻易的one shot一个合格的分词器。这里我们跟着书上使用`tiktoken`这个库里的tokenizer，也是GPT实际训练使用过的tokenizer。
+
 ```python
 import tiktoken
-```
-
-`tiktoken` 是 OpenAI 开源的快速分词库。
-
-```python
 print(tiktoken.__version__)
 tokenizer = tiktoken.get_encoding("gpt2")
 ```
@@ -73,6 +70,8 @@ tokenizer = tiktoken.get_encoding("gpt2")
 - `get_encoding("gpt2")` 加载 GPT-2 使用的编码规则与词表。书中提到了 Byte Pair Encoding（BPE）；我计划以后单独写一篇 blog 进一步学习。
 
 ## 3. 把文本编码成 token IDs
+
+Tokenizer的另一个作用就是给分号的词根据词表（vocabulary）assign一个integer ID，也就是所谓的encoding。形式上就是把tokens，也就是一个list of strings映射到一个list of integers，也可以看作是一个vector。这里值得注意的是，分词和encoding这两个步骤由用tiktoken的分词器的话，是由`.encode()`同时完成。
 
 ```python
 with open("the-verdict.txt", "r", encoding="utf-8") as f:
@@ -204,7 +203,7 @@ input_seq:  [2, 5, 420, 8]
 target_seq: [5, 420, 8, 9]
 ```
 
-`stride` 决定的是下一个窗口从哪里开始，而不是当前 `target_seq` 如何移动。`stride=2` 时，下一个样本是：
+虽然code非常直白，但这里我之前犯过一个理解错误：`stride` 决定的是下一个窗口从哪里开始，而不是当前 `target_seq` 如何移动。**`target_seq`永远是`input_seq`往后移一位（而不是`stride`个位置）**。`stride=2` 时，下一个样本是：
 
 ```text
 input_seq:  [420, 8, 9, 13]
@@ -438,8 +437,6 @@ token embeddings [batch_size, seq_len, embed_dim]
 ▼
 后续 Transformer 模块
 ```
-
-图中把“拆分 tokens”和“映射 token IDs”分开，是为了说明概念；在代码中，我们使用的 `tiktoken` 会通过 `tokenizer.encode(raw_text)` 连续完成这两步。训练目标则来自同一组 token IDs 向右移动一个位置后的副本。
 
 下一步将是把这些输入向量送入注意力机制，学习序列中不同位置之间的关系。
 
