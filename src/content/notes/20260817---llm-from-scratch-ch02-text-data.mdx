@@ -59,7 +59,7 @@ if not os.path.exists("the-verdict.txt"):
 
 ## 2. 创建 GPT-2 分词器
 
-分词，顾名思义，就是将输入的文本“切分”成一个一个独立的词或者组成部分。这些独立的部分被称为tokens。最简单的分词就是只用一个`.strip()`。大多数分词器都有自己的分词规则，对标点的处理，对词首词尾词干等的处理。技术上来说，可以看作就是对strings的operations和利用Python里的`re` module的一系列练习。书上也有包含更基础的手搓一个tokenizer的example。不过现在已有很多开源的LLM训练用的分词器，用AI coding工具应该也能轻易的one shot一个合格的分词器。这里我们跟着书上使用`tiktoken`这个库里的tokenizer，也是GPT实际训练使用过的tokenizer。
+分词，顾名思义，就是将输入的文本“切分”成一个一个独立的词或者组成部分。这些独立的部分被称为tokens。最简单的分词可以直接使用`.split()`。大多数分词器都有自己的分词规则，对标点的处理，对词首词尾词干等的处理。技术上来说，可以看作就是对strings的operations和利用Python里的`re` module的一系列练习。书上也有包含更基础的手搓一个tokenizer的example。不过现在已有很多开源的LLM训练用的分词器，用AI coding工具应该也能轻易的one shot一个合格的分词器。这里我们跟着书上使用`tiktoken`这个库里的tokenizer，也是GPT实际训练使用过的tokenizer。
 
 ```python
 import tiktoken
