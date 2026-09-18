@@ -8,7 +8,9 @@ import JsonLd from '@/components/JsonLd.astro'
 export const prerender = true
 
 export async function getStaticPaths() {
-  const notes = await getCollection('notes')
+  const notes = await getCollection('notes', ({ data }) =>
+    import.meta.env.PROD ? !data.draft : true
+  )
   return notes.map((entry) => ({
     params: { id: entry.id },
     props: { entry }
@@ -37,13 +39,13 @@ const {
 
 let relatedBlogPosts: CollectionEntry<'blog'>[] = []
 if (relatedBlog && relatedBlog.length > 0) {
-  const allBlogPosts = await getCollection('blog')
+  const allBlogPosts = await getCollection('blog', ({ data }) => !data.draft)
   relatedBlogPosts = allBlogPosts.filter((post) => relatedBlog.includes(post.id))
 }
 
 let relatedNoteEntries: CollectionEntry<'notes'>[] = []
 if (relatedNote && relatedNote.length > 0) {
-  const allNotes = await getCollection('notes')
+  const allNotes = await getCollection('notes', ({ data }) => !data.draft)
   relatedNoteEntries = allNotes.filter(
     (note) => relatedNote.includes(note.id) && note.id !== entry.id
   )
