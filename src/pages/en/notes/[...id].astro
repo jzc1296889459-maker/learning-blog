@@ -8,7 +8,9 @@ import JsonLd from '@/components/JsonLd.astro'
 export const prerender = true
 
 export async function getStaticPaths() {
-  const notes = await getCollection('notesEn')
+  const notes = await getCollection('notesEn', ({ data }) =>
+    import.meta.env.PROD ? !data.draft : true
+  )
   return notes
     .filter((entry) => entry.data.translationKey)
     .map((entry) => ({

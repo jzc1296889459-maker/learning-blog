@@ -12,7 +12,7 @@ language: 'en'
 translationKey: '20260821---diffusion-models-and-flow-matching'
 type: note
 status: ready
-draft: false
+draft: true
 ---
 
 # Diffusion Models and Flow Matching
